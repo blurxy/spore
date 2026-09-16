@@ -1040,6 +1040,22 @@ seq)[0..16]`, minus the parent a colony does not have, and is the same disciplin
 tiebreak is a race, and anyone can enter it. Two genesis blocks for one scope then require one
 founder to have signed both at one seq, which is equivocation, and the log already ends there.
 
+**R4c. The byte budget is best-effort in the presence of authority, and says so.**
+
+R4b's "control blocks are never evictable" has a price, and it is not zero: nothing bounds how
+many a colony owner may write, so a spore whose retained authority alone exceeds `maxBytes`
+cannot reach it. `#trim` now scans **every** replica in descending byte order before giving up
+— the previous version took the fattest, fell back to the fattest other one, and stopped, which
+with two founder logs at the top of the ordering left an ordinary member's twelve evictable
+messages untouched while the substrate sat 74% over budget. What the substrate guarantees is
+the weaker, deliverable property: **nothing evictable is left behind**, and `substrate.over_budget`
+fires when the remainder is authority, so the condition is visible rather than silent.
+
+The bound that would close it belongs with grant semantics rather than with eviction: only the
+lowest pin per `(target, scope)` can ever decide anything, and a grant matters only while
+something cites it. Collapsing on that is SP2, alongside re-grant — which SP1 does not model at
+all. A pin below a block's seq stops it, and no later grant lifts that.
+
 **R4b. Eviction may never drop `COLONY_GENESIS`, `ROLE_GRANT` or `ROLE_REVOKE`.**
 
 The byte budget forgets the oldest linked blocks first, and the oldest block in a founder's log

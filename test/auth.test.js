@@ -355,6 +355,12 @@ test('a colony cannot be hijacked by minting a genesis block for its scope', () 
     w.O.logId.toString('hex'),
     'the founder still owns the colony',
   );
+  // The old tiebreak would have picked O about half the time too, so "O won" on its own
+  // proves nothing. These two say X's block founded NOTHING: not a rival claim on O's
+  // colony that lost a hash comparison, and not a colony of X's own either — it names a
+  // scope it cannot derive, so it is malformed, not a founding of something else.
+  assert.equal(s.auth.owners.size, 1, 'X created no colony at all');
+  assert.equal(s.auth.owners.get(colonyIdFor(X.logId, 0).toString('hex')), undefined);
   assert.equal(s.replica(w.M.logId.toString('hex')).linkedTo, 2, 'and M is unaffected');
 });
 
@@ -392,3 +398,53 @@ test('a grant in one colony does not authorise writes in another', () => {
     'the unclaimed block links; the one reaching across colonies stops the log');
   assert.ok(reach.seq > fine.seq);
 });
+
+test('the byte budget is honoured even when the biggest logs are all authority', () => {
+  // #trim picked the fattest replica, and on a null fall back to the fattest OTHER one —
+  // then gave up. That predicate ("has a range") is not the one that matters ("has
+  // something evictable in that range"). Now that control blocks are never dropped, two
+  // founder logs at the top of the byte ordering are enough to end the scan while a third
+  // replica sits there holding nothing but evictable messages.
+  const founders = [identity(), identity()];
+  const keep = [];
+  for (const F of founders) {
+    const scope = colonyIdFor(F.logId, 0);
+    const fw = writer(F, scope);
+    keep.push(fw.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('c') }));
+    for (let i = 0; i < 24; i++) {
+      keep.push(fw.push({
+        type: TYPE.ROLE_GRANT,
+        payload: encodeGrant({ target: Buffer.alloc(16, i + 1), roleId: i }),
+      }));
+    }
+  }
+
+  // One ordinary member, deliberately smaller than either founder log, holding nothing
+  // but blocks the budget is allowed to take.
+  const M = identity();
+  const mw = writer(M, colonyIdFor(founders[0].logId, 0));
+  const chatty = [];
+  for (let i = 0; i < 12; i++) chatty.push(mw.push({ payload: Buffer.from(`msg ${i}`.padEnd(64, '.')) }));
+
+  const s = new Substrate({ maxBytes: 8 * 1024 });
+  load(s, [...keep, ...chatty]);
+
+  // The budget is NOT satisfiable here and is not supposed to be: fifty retained control
+  // blocks exceed it by themselves, and nothing bounds how many an owner may write. What
+  // #trim must guarantee is the weaker, deliverable thing — that it left nothing evictable
+  // behind. The old scan left twelve of the member's messages sitting there.
+  for (const r of s.logs.values()) {
+    for (let x = r.floor; x < r.linkedTo; x++) {
+      const b = r.blocks.get(x);
+      assert.ok(!b || KEEP.has(b.type),
+        `log ${r.key.slice(0, 8)} still holds an evictable block at seq ${x}`);
+    }
+  }
+  assert.ok(s.replica(M.logId.toString('hex')).forgotten > 0, 'the member log gave way');
+  assert.equal(s.auth.owners.size, 2, 'and both colonies still have their owners');
+  assert.ok(s.bytes > s.maxBytes, 'over budget, on authority alone, visibly');
+});
+
+// The types eviction may never drop, mirrored from the substrate so the test states the
+// property rather than importing the implementation's opinion of it.
+const KEEP = new Set([TYPE.COLONY_GENESIS, TYPE.ROLE_GRANT, TYPE.ROLE_REVOKE]);

@@ -730,32 +730,44 @@ export class Substrate extends EventEmitter {
    * everyone else's history out. Stops when nothing is evictable — a substrate made
    * entirely of unlinked blocks cannot shrink, and pretending otherwise by dropping them
    * would just mean fetching them again.
+   *
+   * RESIDUAL, STATED RATHER THAN FIXED: the budget is not a hard ceiling, because control
+   * blocks are never evictable (see forgetOldest) and nothing bounds how many of them a
+   * colony owner may write. A spore whose retained authority alone exceeds `maxBytes` ends
+   * this loop over budget with nothing left to give, and counts `substrate.over_budget` so
+   * the condition is visible rather than silent. What IS guaranteed is that nothing
+   * evictable is left behind — which is the invariant the tests assert, because it is the
+   * one this function can actually deliver.
+   *
+   * The bound that closes it belongs with grant semantics, not here: only the lowest pin
+   * per (target, scope) can ever decide anything, and a grant matters only while something
+   * cites it. Collapsing on that is SP2 work, alongside re-grant, which SP1 does not model
+   * at all — a pin below a block's seq stops it, and no later grant lifts that.
    */
   #trim() {
     let guard = 0;
-    while (this.bytes > this.maxBytes && guard++ < 100000) {
-      let victim = null;
-      for (const r of this.logs.values()) {
-        if (r.bytes > 0 && (!victim || r.bytes > victim.bytes)) victim = r;
+    while (this.bytes > this.maxBytes && guard++ < 1000000) {
+      // Largest first, so one noisy log cannot push everyone else's history out — but try
+      // EVERY replica before giving up. The previous version took the fattest, and on a
+      // null fell back to the fattest OTHER one, then stopped. That predicate asked "does
+      // this replica have a range" rather than "is there anything evictable in it", and
+      // once control blocks stopped being evictable, two founder logs at the top of the
+      // ordering were enough to end the scan while an ordinary member sat below them
+      // holding nothing but blocks the budget was allowed to take.
+      const order = [...this.logs.values()]
+        .filter((r) => r.bytes > 0)
+        .sort((a, b) => (b.bytes - a.bytes) || (a.key < b.key ? -1 : 1));
+      let gone = null;
+      for (const r of order) {
+        gone = r.forgetOldest();
+        if (gone) break;
       }
-      if (!victim) break;
-      const gone = victim.forgetOldest();
-      if (!gone) {
-        // This replica cannot give anything up. Try the next largest that can.
-        const others = [...this.logs.values()].filter((r) => r !== victim && r.linkedTo > r.floor);
-        if (!others.length) break;
-        const next = others.reduce((a, r) => (r.bytes > a.bytes ? r : a), others[0]);
-        const g2 = next.forgetOldest();
-        if (!g2) break;
-        this.bytes -= g2.bytes;
-        this.byHash.delete(g2.hash.toString('hex'));
-        this.tel?.count('substrate.forgotten');
-        continue;
-      }
+      if (!gone) break; // nothing anywhere is evictable; see the note on residual overage
       this.bytes -= gone.bytes;
       this.byHash.delete(gone.hash.toString('hex'));
       this.tel?.count('substrate.forgotten');
     }
+    if (this.bytes > this.maxBytes) this.tel?.count('substrate.over_budget');
   }
 
   /** Everything we hold, as HAVE advertisements. One entry per log. */
