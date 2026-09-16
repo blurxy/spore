@@ -43,8 +43,38 @@ network.
 
 ## Does it really get faster as people join?
 
-For some things, over a bounded range. `docs/ARCHITECTURE.md` §3 has the honest table.
-The short version, after three adversarial reviews tore up the optimistic original:
+**Yes, and it is now measured rather than derived.** `node bench/curve.js` runs the swarm
+against a token-bucket model with a shared Wi-Fi cell cap, and declares its falsifiers
+*before* the run so the result cannot be rationalised afterwards.
+
+```
+   N   sync      speedup
+   1   66.5s      1.00x
+   2   33.3s      1.99x
+   3   23.1s      2.88x
+   4   20.2s      3.29x   <- the knee
+  20   20.5s      3.25x   <- flat
+```
+
+`ARCHITECTURE.md` §3 predicted **3.3x saturating near N=5**, from arithmetic, before any
+code existed. Measured: **3.29x saturating at N=4**. All three falsifiers pass:
+
+- capped curve flat from N=5 to N=20 (3.24x → 3.25x) — the medium binds, as predicted
+- uncapped control keeps gaining (4.83x → 5.97x) — so supply really does scale, and the
+  shared cell really is what bends the curve
+- churn survivors within 2x of a clean run (1.10x)
+
+Two findings the benchmark produced that the design did not have:
+
+- **At real Wi-Fi rates, sync is hash-bound, not network-bound.** `blake2b256` is BigInt
+  at ~3.5 MB/s and a joiner hashes every byte it verifies. Benchmark rates are scaled 10x
+  down so the network is the constraint under test. The 32-bit-pair rewrite is required
+  before SP2, and the oracle test exists now to make that safe.
+- **Churn costs completion, not speed.** At one departure every 2s, survivors stayed fast
+  (1.10x) but only 3 of 10 joiners ever finished. The swarm does not degrade gracefully;
+  it degrades by losing people.
+
+The rest, after three adversarial reviews tore up the optimistic original:
 
 - **Within one Wi-Fi access point, gains saturate around N≈5 at about 3.3×.** Wi-Fi in
   infrastructure mode is a shared medium and every peer-to-peer byte crosses the air
