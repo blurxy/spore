@@ -34,6 +34,25 @@ export class Bitfield {
   get complete() {
     return this.count === this.size;
   }
+  /**
+   * Widen to `size` bits, preserving what is set.
+   *
+   * A torrent knows its piece count up front; an append-only log does not. The set of
+   * blocks a log has is discovered as peers advertise heads further out than ours, so the
+   * bitfield has to grow underneath the scheduler without disturbing it. Shrinking is not
+   * offered — a log only ever gets longer.
+   */
+  grow(size) {
+    if (size <= this.size) return this;
+    const bytes = Math.ceil(size / 8);
+    if (bytes > this.bits.length) {
+      const next = new Uint8Array(bytes);
+      next.set(this.bits);
+      this.bits = next;
+    }
+    this.size = size;
+    return this;
+  }
   static full(size) {
     const b = new Bitfield(size);
     b.bits.fill(0xff);

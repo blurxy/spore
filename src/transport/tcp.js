@@ -35,16 +35,30 @@ export function dialAllowed(host) {
   return { ok: false, range: null };
 }
 
-/** Length-prefixed frame reader. Refuses oversize before allocating anything. */
+/**
+ * Length-prefixed frame reader. Refuses oversize before allocating anything.
+ *
+ * `stop()` matters more than it looks. TCP coalesces, so the last handshake message and
+ * the first application frame routinely arrive in ONE chunk. Without a way to halt
+ * mid-chunk, this loop would hand that application frame to the handshake — which is
+ * finished — and the bytes would be consumed and discarded. Everything after that
+ * decrypts one counter out of step, which surfaces as an AEAD failure that looks like
+ * a crypto bug and is really a buffer-handoff bug. `rest` is what a stopped reader
+ * still holds, so the next owner of the socket can pick up exactly where this one left off.
+ */
 export class FrameReader {
   constructor(onFrame, onError) {
     this.buf = Buffer.alloc(0);
     this.onFrame = onFrame;
     this.onError = onError;
+    this.stopped = false;
   }
+  stop() { this.stopped = true; }
+  get rest() { return this.buf; }
   push(chunk) {
     this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
     for (;;) {
+      if (this.stopped) return;
       if (this.buf.length < 4) return;
       const len = this.buf.readUInt32LE(0);
       if (len > MAX_FRAME) return this.onError(new Error(`oversize frame ${len}`));
@@ -67,12 +81,15 @@ export function frame(payload) {
  * per-direction key and counter derived by the handshake.
  */
 export class Hypha extends EventEmitter {
-  constructor(socket, cipher, peerId, meta = {}) {
+  constructor(socket, cipher, peerId, meta = {}, carryover = null) {
     super();
     this.socket = socket;
     this.cipher = cipher;
     this.peerId = peerId;
     this.meta = meta;
+    // Bytes the handshake reader had already pulled off the socket but did not own.
+    // Held, not replayed: replaying now would emit 'message' before anybody is listening.
+    this.carryover = carryover && carryover.length ? Buffer.from(carryover) : null;
     this.bytesIn = 0;
     this.bytesOut = 0;
     this.framesIn = 0;
@@ -93,6 +110,20 @@ export class Hypha extends EventEmitter {
 
   get sas() { return this.cipher.sas; }
   get hyphaId() { return this.cipher.hyphaId; }
+
+  /**
+   * Start delivering. Called once, by the manager, after every listener is attached.
+   *
+   * The socket is handed over paused precisely so this can be ordered correctly: frames
+   * that arrive between the end of the handshake and the manager wiring up its handlers
+   * would otherwise be emitted to nobody and lost without trace.
+   */
+  resume() {
+    const carry = this.carryover;
+    this.carryover = null;
+    if (carry) this.reader.push(carry);
+    if (!this.closed) this.socket.resume();
+  }
 
   #ad() {
     // cleartext associated data: 0x53 | epoch | reserved | seq_lo.
@@ -146,6 +177,14 @@ function runHandshake(socket, hs, telemetry, timeoutMs = 8000) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (!err) {
+        // Stop consuming, then stop the flow. Both are required: stop() keeps this reader
+        // from eating an application frame that shared a TCP segment with the last
+        // handshake message, and pause() keeps the socket from emitting to nobody during
+        // the await between here and the hypha being wired up.
+        reader.stop();
+        socket.pause();
+      }
       socket.removeListener('data', onData);
       err ? reject(err) : resolve(val);
     };
@@ -169,10 +208,10 @@ function runHandshake(socket, hs, telemetry, timeoutMs = 8000) {
         try {
           hs.readMessage(f);
           report();
-          if (hs.done) return finish(null, hs.finish());
+          if (hs.done) return finish(null, { cipher: hs.finish(), carryover: reader.rest });
           socket.write(frame(hs.writeMessage()));
           report();
-          if (hs.done) return finish(null, hs.finish());
+          if (hs.done) return finish(null, { cipher: hs.finish(), carryover: reader.rest });
         } catch (e) {
           telemetry?.count(`hypha.handshake.failed.${e.code || 'error'}`);
           finish(e);
@@ -216,6 +255,11 @@ export class HyphaManager extends EventEmitter {
     this.server = null;
     this.hyphae = new Map();
     this.dialing = new Set();
+    // Every socket we own, including ones still mid-handshake and ones whose handshake
+    // failed. `hyphae` holds only the connections that made it; shutdown has to account
+    // for the ones that did not. See stop().
+    this.sockets = new Set();
+    this.stopping = false;
   }
 
   listen() {
@@ -234,8 +278,15 @@ export class HyphaManager extends EventEmitter {
     return Buffer.compare(this.sporeId, peerId) < 0;
   }
 
+  #track(socket) {
+    this.sockets.add(socket);
+    socket.once('close', () => this.sockets.delete(socket));
+  }
+
   async #inbound(socket) {
+    if (this.stopping) return socket.destroy();
     socket.setNoDelay(true);
+    this.#track(socket);
     this.tel?.count('hypha.inbound');
     const hs = new Handshake({
       initiator: false,
@@ -244,8 +295,8 @@ export class HyphaManager extends EventEmitter {
       idPrivate: this.idPrivate,
     });
     try {
-      const cipher = await runHandshake(socket, hs, this.tel);
-      this.#adopt(new Hypha(socket, cipher, hs.peerId, { initiator: false }));
+      const { cipher, carryover } = await runHandshake(socket, hs, this.tel);
+      this.#adopt(new Hypha(socket, cipher, hs.peerId, { initiator: false }, carryover));
     } catch (e) {
       this.tel?.event('hypha.handshake.failed', { reason: e.code || e.message, initiator: false });
       try { socket.destroy(); } catch {}
@@ -274,6 +325,7 @@ export class HyphaManager extends EventEmitter {
       });
       socket.setNoDelay(true);
       socket.setTimeout(0);
+      this.#track(socket);
 
       const hs = new Handshake({
         initiator: true,
@@ -281,8 +333,8 @@ export class HyphaManager extends EventEmitter {
         idPublicRaw: this.idPublicRaw,
         idPrivate: this.idPrivate,
       });
-      const cipher = await runHandshake(socket, hs, this.tel);
-      return this.#adopt(new Hypha(socket, cipher, hs.peerId, { initiator: true, host }));
+      const { cipher, carryover } = await runHandshake(socket, hs, this.tel);
+      return this.#adopt(new Hypha(socket, cipher, hs.peerId, { initiator: true, host }, carryover));
     } catch (e) {
       this.tel?.event('hypha.dial_failed', { host, reason: e.code || e.message });
       return null;
@@ -322,6 +374,7 @@ export class HyphaManager extends EventEmitter {
     });
     hypha.on('message', (m) => this.emit('message', { hypha, payload: m }));
     this.emit('hypha', hypha);
+    hypha.resume(); // last: every listener above is attached, nothing can be dropped now
     return hypha;
   }
 
@@ -333,10 +386,28 @@ export class HyphaManager extends EventEmitter {
     return n;
   }
 
+  /**
+   * Shut down deterministically.
+   *
+   * `server.close()` does NOT close connections — it stops accepting and then waits for
+   * every existing one to end on its own. So closing the hyphae is not enough: a socket
+   * that is still mid-handshake, or whose handshake failed, is not in `hyphae` and nothing
+   * would ever close it, and the callback never fires. That is a process that will not
+   * exit — on a laptop an annoyance, on a phone a background task the OS kills for you
+   * later and blames you for.
+   *
+   * So: refuse new arrivals, close the hyphae, destroy whatever sockets remain, and only
+   * then wait for the server. By that point there is nothing left to wait for.
+   */
   async stop() {
+    this.stopping = true;
     for (const h of this.hyphae.values()) h.close('shutdown');
     this.hyphae.clear();
-    if (this.server) await new Promise((r) => this.server.close(r));
+    for (const s of this.sockets) {
+      try { s.destroy(); } catch { /* already gone */ }
+    }
+    this.sockets.clear();
+    if (this.server) await new Promise((r) => this.server.close(() => r()));
     this.server = null;
   }
 }

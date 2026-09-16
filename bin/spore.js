@@ -13,8 +13,11 @@ import { generateKeyPairSync, createHash } from 'node:crypto';
 import { Telemetry } from '../src/telemetry/bus.js';
 import { Beacon, HYPHA_PORT } from '../src/transport/beacon.js';
 import { HyphaManager } from '../src/transport/tcp.js';
-import { generateStatic, edPub } from '../src/session/noise.js';
-import { encodeBlock, verifyBlock, newLogId, deriveLamport, TYPE, FLAG } from '../src/substrate/block.js';
+import { generateStatic } from '../src/session/noise.js';
+import { encodeBlock, logIdFor, deriveLamport, TYPE, FLAG } from '../src/substrate/block.js';
+import { Substrate } from '../src/substrate/store.js';
+import { Syncer } from '../src/sharding/sync.js';
+import { blockFits } from '../src/sharding/wire.js';
 import { Screen } from '../src/ui/canvas.js';
 import { MyceliumView, PAL } from '../src/ui/mycelium.js';
 
@@ -40,9 +43,14 @@ tel.trackRate('beacon.sent');
 const idKeys = generateKeyPairSync('ed25519');
 const sporeId = idKeys.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
 const staticKeys = generateStatic();
-const logId = newLogId();
+
+// The log is NAMED BY ITS AUTHOR: log_id = hash256(spore_id)[0..16]. Not a random id.
+// Once blocks travel through third parties, a log has to carry proof of who may write it,
+// and this binding is that proof — it lives inside the signed header of every block.
+const logId = logIdFor(sporeId);
 let seq = 0n;
 let lamport = 0n;
+let prevHash = Buffer.alloc(32);
 
 const beacon = new Beacon({
   sporeId, idPrivate: idKeys.privateKey, networkKey: NETWORK_KEY,
@@ -53,51 +61,73 @@ const mgr = new HyphaManager({
   telemetry: tel, port: PORT,
 });
 
+const substrate = new Substrate({ telemetry: tel });
+const sync = new Syncer({ substrate, hyphaManager: mgr, telemetry: tel, selfPub: sporeId, selfLogId: logId });
+
 const view = new MyceliumView(tel, { nick: NICK, sporeId: sporeId.toString('hex') });
 
-// --- the substrate: append a signed block, broadcast cert + payload ---------------
+// --- the substrate: append a signed block, push it, let the syncer serve it ---------
+//
+// Two paths now, and they are deliberately different. `say()` PUSHES: a live message goes
+// straight to every hypha, unscheduled, because latency is what matters and there is
+// nothing to schedule. The Syncer PULLS: history is fetched rarest-first from whoever has
+// it, because throughput is what matters and there is a lot to schedule. Conflating them
+// would make live chat wait behind a backlog, which is the wrong trade in both directions.
 function say(text) {
   const payload = Buffer.from(text, 'utf8');
   seq += 1n;
   lamport = deriveLamport(lamport, []);
-  const { cert } = encodeBlock(
-    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId, seq, lamport, payload },
+  const { cert, blockHash } = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId, seq, lamport, prevHash, payload },
     idKeys.privateKey,
   );
-  const wire = Buffer.concat([cert, payload]);
-  const n = mgr.broadcast(wire);
-  tel.count('hypha.bytes', wire.length * Math.max(1, n));
+  if (!blockFits(cert.length, payload.length)) {
+    view.log('TOO BIG', 'message exceeds one frame', PAL.alarm);
+    seq -= 1n;
+    return 0;
+  }
+  prevHash = blockHash;
+
+  // Into our own substrate first. We are a replica of our own log like any other, and
+  // serving it to peers goes through exactly the same path theirs does.
+  const res = substrate.insert(cert, payload, sporeId, 'self');
+  if (!res.ok) {
+    view.log('REJECT', `own block: ${res.reason}`, PAL.alarm);
+    return 0;
+  }
+
+  const n = sync.push(cert, payload);
+  sync.announce(logId, Number(seq));
+  tel.count('hypha.bytes', (cert.length + payload.length) * Math.max(1, n));
   tel.event('substrate.appended', { seq: Number(seq), lamport: Number(lamport), toPeers: n, text });
   view.lamport = Number(lamport);
   view.message(NICK, text);
   return n;
 }
 
-mgr.on('message', ({ hypha, payload }) => {
-  tel.count('hypha.bytes', payload.length);
-  // Everything a peer sends is untrusted until the signature says otherwise, and we
-  // verify against the identity the HANDSHAKE proved — never against a claim in the frame.
-  const CERT_LEN = 196 + 64;
-  if (payload.length < CERT_LEN) return;
-  const cert = payload.subarray(0, CERT_LEN);
-  const body = payload.subarray(CERT_LEN);
+mgr.on('message', ({ payload }) => tel.count('hypha.bytes', payload.length));
 
-  const v = verifyBlock(cert, edPub(Buffer.from(hypha.peerId)), body);
-  if (!v.ok) {
-    tel.count(`substrate.reject.${v.reason.split(':')[0]}`);
-    view.log('REJECT', v.reason, PAL.alarm);
-    return;
-  }
-  lamport = deriveLamport(lamport, [v.block.lamport]);
-  const who = Buffer.from(hypha.peerId).toString('hex').slice(0, 6);
-  tel.event('substrate.verified', {
-    from: who,
-    seq: Number(v.block.seq),
-    lamport: Number(v.block.lamport),
-    text: body.toString('utf8').slice(0, 60),
-  });
+// Every accepted block, however it arrived — pushed live or pulled from a backlog. The
+// substrate has already verified the signature against the key the LOG ID names, not
+// against whoever handed it over, so a block relayed by a stranger is worth exactly as
+// much as one from its author.
+substrate.on('block', ({ logId: lid, seq: s, block, payload, from }) => {
+  if (lid.equals(logId)) return; // our own, already shown by say()
+  lamport = deriveLamport(lamport, [block.lamport]);
   view.lamport = Number(lamport);
-  view.message(who, body.toString('utf8').slice(0, 200));
+  const who = lid.toString('hex').slice(0, 6);
+  tel.event('substrate.verified', { from, log: who, seq: s, lamport: Number(block.lamport) });
+  if (block.type === TYPE.MESSAGE) view.message(who, payload.toString('utf8').slice(0, 200));
+});
+
+substrate.on('equivocation', ({ logId: lid, seq: s }) => {
+  // The author signed two different blocks at one seq. Both signatures are valid, so this
+  // is not a network fault — it is that spore contradicting itself, and it is permanent.
+  view.log('FORKED', `${lid.toString('hex').slice(0, 6)} signed twice at seq ${s}`, PAL.alarm);
+});
+
+sync.on('complete', ({ logId: lid, blocks }) => {
+  view.log('GRAFTED', `${lid.toString('hex').slice(0, 6)} · ${blocks} blocks`, PAL.core);
 });
 
 // --- discovery -> dial ------------------------------------------------------------
@@ -113,6 +143,7 @@ let raf = null;
 async function main() {
   await mgr.listen();
   await beacon.start();
+  sync.start();
 
   if (HEADLESS) {
     tel.on('telemetry', ({ kind, payload }) => {
@@ -153,6 +184,7 @@ async function shutdown() {
   if (stopping) return;
   stopping = true;
   clearTimeout(raf);
+  sync.stop();
   if (screen) {
     const s = screen.stats;
     screen.exit();

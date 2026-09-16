@@ -170,6 +170,39 @@ export function deriveLamport(prevLamport, depLamports = []) {
   return m + 1n;
 }
 
+/**
+ * A log announces its own writer.
+ *
+ * Logs are single-writer, so every block in a log must be signed by the same key. But
+ * until block transfer existed, nothing had to prove WHICH key: a spore only ever received
+ * blocks from their author across an authenticated hypha, so "the key the handshake proved"
+ * was always the right answer.
+ *
+ * Replication breaks that. Fetching Alice's blocks from Bob means verifying a signature
+ * against a key Bob hands us, and a random 16-byte log_id gives us no way to know it is
+ * the right one — Bob could serve blocks he signed himself and call them Alice's log.
+ *
+ * So the log_id IS the author, truncated: log_id = hash256(author_pub)[0..16]. It sits in
+ * the header at offset 4, inside the signed region, in every block. Verification becomes
+ * two checks that together are unforgeable: the signature verifies under the supplied key,
+ * AND that key hashes to the log_id the block claims. Claiming another spore's log now
+ * requires a 128-bit preimage on their public key.
+ *
+ * 16 bytes rather than the full 32 because the header field is 16 bytes and widening it
+ * would cost 16 bytes on every block forever to buy collision resistance nothing needs —
+ * the second check already pins the exact key.
+ */
+export function logIdFor(authorPubRaw) {
+  if (authorPubRaw.length !== 32) throw new Error(`author pub must be 32 bytes, got ${authorPubRaw.length}`);
+  return hash256(authorPubRaw).subarray(0, 16);
+}
+
+/** True if `authorPubRaw` is the writer this log_id names. */
+export function logIdMatches(logId, authorPubRaw) {
+  return logId.length === 16 && logIdFor(authorPubRaw).equals(logId);
+}
+
+/** Random log id. Test/scratch use only — a real log is named by its author. */
 export function newLogId() {
   return randomBytes(16);
 }
