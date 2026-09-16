@@ -50,6 +50,29 @@ const ZERO16 = Buffer.alloc(16);
 const ZERO32 = Buffer.alloc(32);
 
 /**
+ * A colony names its own founder, the same way a log names its own writer.
+ *
+ * Without this, "who owns colony C" is decided by comparing two blocks that anyone can
+ * write. A fresh identity mints COLONY_GENESIS with scope_id = C — it chains, its lamport
+ * derives, it claims no authority, so it links — and roughly half the time its block hash
+ * sorts below the real founder's and it takes the colony: its revocations start counting
+ * and the founder's grants stop, because the grants no longer come from "the owner". One
+ * cheap block, whole colony locked out, every spore agreeing.
+ *
+ * Deriving the id closes it by construction rather than by arbitration. The shape follows
+ * design-substrate.md's own `fruiting_id = BLAKE2b(colony_id || creator_log_id || seq)`,
+ * minus the parent a colony does not have. Two genesis blocks for one scope now require
+ * one founder to have signed both at one seq, which is equivocation, and the log already
+ * ends at a fork.
+ */
+export function colonyIdFor(founderLogId, seq) {
+  const b = Buffer.alloc(24);
+  founderLogId.copy(b, 0);
+  b.writeBigUInt64LE(BigInt(seq), 16);
+  return hash256(b).subarray(0, 16);
+}
+
+/**
  * ROLE_GRANT / ROLE_REVOKE payloads.
  *
  * design-app.md gives the op as ROLE_GRANT/REVOKE(member, role_id). REVOKE carries one

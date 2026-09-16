@@ -18,7 +18,7 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import {
   encodeBlock, logIdFor, TYPE, FLAG,
-  encodeGrant, decodeGrant, encodeRevoke, decodeRevoke,
+  encodeGrant, decodeGrant, encodeRevoke, decodeRevoke, colonyIdFor,
 } from '../src/substrate/block.js';
 import { Substrate } from '../src/substrate/store.js';
 
@@ -36,7 +36,7 @@ function writer(id, scopeId) {
   return {
     id,
     /** Append one block. `deps` raises lamport; `authRef` never does — that is the bug. */
-    push({ type = TYPE.MESSAGE, payload = Buffer.alloc(0), authRef = null, deps = [], depLamports = [] } = {}) {
+    push({ type = TYPE.MESSAGE, payload = Buffer.alloc(0), authRef = null, deps = [], depLamports = [], scopeId: override = null } = {}) {
       let m = lamport;
       for (const d of depLamports) if (d > m) m = d;
       lamport = m + 1n;
@@ -47,7 +47,7 @@ function writer(id, scopeId) {
           logId: id.logId,
           seq,
           lamport,
-          scopeId,
+          scopeId: override || scopeId,
           prevHash,
           authRef: authRef || Buffer.alloc(32),
           payload,
@@ -78,8 +78,8 @@ function writer(id, scopeId) {
  * revocations cannot shrink as frontiers move.
  */
 function v1World({ pinBehind = 0, ownerTraffic = 8 } = {}) {
-  const scopeId = Buffer.alloc(16, 0xc0);
   const O = identity();
+  const scopeId = colonyIdFor(O.logId, 0); // the colony names its founder
   const M = identity();
   const ow = writer(O, scopeId);
   const mw = writer(M, scopeId);
@@ -173,8 +173,8 @@ test('V1: retraction is announced, not silent', () => {
 });
 
 test('an unrevoked grant still works, and a revoke only reaches its own target', () => {
-  const scopeId = Buffer.alloc(16, 0xc0);
   const O = identity();
+  const scopeId = colonyIdFor(O.logId, 0);
   const M = identity();
   const N = identity();
   const ow = writer(O, scopeId);
@@ -199,8 +199,8 @@ test('an unrevoked grant still works, and a revoke only reaches its own target',
 });
 
 test('a revoke from someone who is not the colony owner has no power', () => {
-  const scopeId = Buffer.alloc(16, 0xc0);
   const O = identity();
+  const scopeId = colonyIdFor(O.logId, 0);
   const M = identity();
   const X = identity(); // an ordinary member with opinions
   const ow = writer(O, scopeId);
@@ -238,8 +238,8 @@ test('a block citing a grant we do not hold STALLS; it does not link and does no
 });
 
 test('a block citing a grant issued to somebody else stops its own log', () => {
-  const scopeId = Buffer.alloc(16, 0xc0);
   const O = identity();
+  const scopeId = colonyIdFor(O.logId, 0);
   const M = identity();
   const N = identity();
   const ow = writer(O, scopeId);
@@ -258,8 +258,8 @@ test('a block citing a grant issued to somebody else stops its own log', () => {
 
 test('auth_ref = 0 is unaffected by any of this', () => {
   // Every SP1 MESSAGE claims nothing, so none of this machinery may touch the common path.
-  const scopeId = Buffer.alloc(16, 0xc0);
   const O = identity();
+  const scopeId = colonyIdFor(O.logId, 0);
   const M = identity();
   const ow = writer(O, scopeId);
   const mw = writer(M, scopeId);
@@ -293,4 +293,102 @@ test('grant/revoke payloads round-trip and reject wrong lengths', () => {
   assert.throws(() => decodeRevoke(g), /revoke payload 20/);
   assert.throws(() => decodeGrant(r), /grant payload 28/);
   assert.throws(() => encodeGrant({ target: Buffer.alloc(8) }), /16 bytes/);
+});
+
+// --- the budget must not be able to launder a revocation -----------------------------
+
+test('eviction cannot un-revoke, un-own, or un-grant a colony', () => {
+  // forgetOldest() takes the oldest LINKED blocks first, and the oldest block in the
+  // owner's log is COLONY_GENESIS. Drop it and nobody owns the colony; drop a ROLE_REVOKE
+  // and the demoted moderator's blocks link again. A spore that has been running long
+  // enough to hit its byte budget would quietly re-admit everyone it had ever removed,
+  // and nothing in the substrate would report it.
+  const w = v1World({ ownerTraffic: 40 });
+  const all = [w.genesis, w.grant, ...w.mBefore, ...w.traffic, w.revoke, w.replay];
+
+  // A budget far below what this world needs, so eviction runs hard.
+  const each = all[0].cert.length + all[0].payload.length;
+  const s = new Substrate({ maxBytes: each * 6 });
+  load(s, all);
+
+  const mr = s.replica(w.M.logId.toString('hex'));
+  assert.ok(mr.linkedTo <= w.pinSeq, `M linked to ${mr.linkedTo}, past the pin ${w.pinSeq}`);
+  assert.ok(s.auth.owners.size > 0, 'the colony must still have an owner');
+  assert.ok(s.auth.revokes.size > 0, 'the revocation must still be in force');
+});
+
+test('a frontier survives a recomputation that happens after eviction', () => {
+  // relink() resets to `floor - 1` and walks up, so the first block it looks at needs the
+  // hash and lamport of its predecessor — which eviction has just deleted. Nothing
+  // exercised that before, because a full recomputation only ran on a fork and the
+  // eviction tests never forked. Authority made recomputation common.
+  const w = v1World({ ownerTraffic: 30 });
+  const all = [w.genesis, w.grant, ...w.mBefore, ...w.traffic, w.revoke];
+  const each = all[0].cert.length + all[0].payload.length;
+
+  const s = new Substrate({ maxBytes: each * 8 });
+  load(s, all);
+  const or = s.replica(w.O.logId.toString('hex'));
+  const before = or.linkedTo;
+  assert.ok(or.floor > 0, 'the test is pointless unless eviction actually ran');
+
+  // Any control block linking re-resolves every frontier from the floor up.
+  load(s, [w.replay]);
+  assert.equal(s.replica(w.O.logId.toString('hex')).linkedTo, before,
+    "the owner's frontier must not collapse just because old history was forgotten");
+});
+
+test('a colony cannot be hijacked by minting a genesis block for its scope', () => {
+  // scope_id has to be derived from the founder, or "who owns this colony" is decided by
+  // a hash comparison between two blocks anyone can write — one cheap block from a fresh
+  // identity wins the colony half the time, and then the real owner's grants stop working.
+  const w = v1World();
+  const X = identity();
+  const xw = writer(X, w.scopeId);
+  const hijack = xw.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('mine now') });
+
+  const s = new Substrate();
+  load(s, [w.genesis, w.grant, ...w.mBefore, hijack]);
+
+  assert.equal(
+    s.auth.owners.get(w.scopeId.toString('hex')),
+    w.O.logId.toString('hex'),
+    'the founder still owns the colony',
+  );
+  assert.equal(s.replica(w.M.logId.toString('hex')).linkedTo, 2, 'and M is unaffected');
+});
+
+test('a grant in one colony does not authorise writes in another', () => {
+  // Revocation pins carry a scope. If grants do not, the two are asymmetric: an owner of
+  // two colonies who revokes someone from one has not revoked them from the other, yet
+  // their grant in the first still authorises blocks in the second.
+  //
+  // Both colonies get a real, derived genesis from the same founder, so colony B has an
+  // owner and the block is STOPPED on its merits — not stalled for want of one, which is
+  // what an earlier version of this test was actually measuring.
+  const O = identity();
+  const M = identity();
+  const A = colonyIdFor(O.logId, 0);
+  const B = colonyIdFor(O.logId, 1);
+
+  const ow = writer(O, A);
+  const genA = ow.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('A') });
+  assert.equal(genA.seq, 0);
+  // The same log founds the second colony at its next seq, so B's derived id is B.
+  const genB = ow.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('B'), scopeId: B });
+  assert.equal(genB.seq, 1);
+  const grantA = ow.push({ type: TYPE.ROLE_GRANT, payload: encodeGrant({ target: M.logId }) });
+
+  const mw = writer(M, B);
+  const fine = mw.push({ payload: Buffer.from('no claim') });
+  const reach = mw.push({ payload: Buffer.from('elsewhere'), authRef: grantA.hash });
+
+  const s = new Substrate();
+  load(s, [genA, genB, grantA, fine, reach]);
+
+  assert.equal(s.auth.owners.get(A.toString('hex')), O.logId.toString('hex'), 'A is owned');
+  assert.equal(s.auth.owners.get(B.toString('hex')), O.logId.toString('hex'), 'B is owned too');
+  assert.equal(s.replica(M.logId.toString('hex')).linkedTo, fine.seq,
+    'the unclaimed block links; the one reaching across colonies stops the log');
+  assert.ok(reach.seq > fine.seq);
 });

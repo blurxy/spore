@@ -20,7 +20,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
-import { encodeBlock, logIdFor, TYPE, FLAG, encodeGrant, encodeRevoke } from '../src/substrate/block.js';
+import {
+  encodeBlock, logIdFor, TYPE, FLAG, encodeGrant, encodeRevoke, colonyIdFor,
+} from '../src/substrate/block.js';
 import { Substrate } from '../src/substrate/store.js';
 import { Syncer, MAX_INFLIGHT_PER_PEER } from '../src/sharding/sync.js';
 import {
@@ -71,8 +73,11 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null,
   const built = []; // { hash, lamport } for dep selection
   const out = [];
 
-  // scope_id is only meaningful once there is a colony to be a member of.
-  const scopeId = authority ? Buffer.alloc(16, 0xc0) : Buffer.alloc(16);
+  // scope_id is only meaningful once there is a colony to be a member of — and it is not
+  // a constant. A colony names its founder, so the id has to be derived from log 0 at the
+  // seq its genesis will occupy, or the genesis is ignored and every authority check in
+  // this world stalls instead of deciding anything.
+  const scopeId = authority ? colonyIdFor(ids[0].logId, 0) : Buffer.alloc(16);
 
   const emit = (li, { type = TYPE.MESSAGE, payload, authRef = null, deps = [], depLamport = 0n }) => {
     const id = ids[li];
@@ -255,7 +260,10 @@ test('property: the verified frontier only ever moves forward, except behind a f
 test('property: eviction never lowers the frontier, however tight the budget', () => {
   for (let seed = 1; seed <= 25; seed++) {
     const r = rng(seed);
-    const world = buildWorld(r, { logs: 2, blocks: 30 });
+    // Authority on, budget tight. These two were only ever tested apart, and apart is
+    // exactly where the interaction hides: the oldest block in the owner's log is its
+    // COLONY_GENESIS, so the plain eviction rule feeds authority to the byte budget first.
+    const world = buildWorld(r, { logs: 2, blocks: 30, authority: r() < 0.5 });
     const each = world.blocks[0].cert.length + world.blocks[0].payload.length;
 
     const s = new Substrate({ maxBytes: each * (2 + Math.floor(r() * 8)) });

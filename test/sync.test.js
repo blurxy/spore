@@ -376,6 +376,36 @@ function forkedChain(id, n, at) {
   return { main, other: { cert, payload } };
 }
 
+test('store: a forgotten predecessor does not collapse the frontier on recompute', () => {
+  // relink() restarts at `floor` and asks for the hash and lamport of the block before it
+  // — which eviction has just deleted. Nothing exercised that before: a full recompute
+  // only ran on a fork, and the eviction tests never forked. Measured on the broken code,
+  // a 20-block log evicted to floor 15 kept linkedTo 19 right up until something forced a
+  // recompute, then fell to 14 and promoted nothing, permanently. Forgetting old history
+  // is supposed to cost old history, not the frontier above it.
+  const quiet = identity();
+  const noisy = identity();
+  const blocks = chain(quiet, 20, 'x'.repeat(40));
+  const each = blocks[0].cert.length + blocks[0].payload.length;
+
+  const s = new Substrate({ maxBytes: each * 5 });
+  for (const b of blocks) s.insert(b.cert, b.payload, quiet.pub);
+
+  const r = s.replica(quiet.logId.toString('hex'));
+  assert.ok(r.floor > 0, 'the test is pointless unless eviction actually ran');
+  const before = r.linkedTo;
+  assert.equal(before, 19);
+
+  // An equivocation anywhere re-resolves every frontier in the substrate, this one too.
+  const { main, other } = forkedChain(noisy, 6, 3);
+  for (const b of main) s.insert(b.cert, b.payload, noisy.pub);
+  s.insert(other.cert, other.payload, noisy.pub);
+
+  assert.equal(s.replica(quiet.logId.toString('hex')).linkedTo, before,
+    'an unrelated fork must not cost this log the history it still holds');
+  assert.equal(s.replica(noisy.logId.toString('hex')).forkedAt, 3, 'and the fork is real');
+});
+
 test('store: two spores that meet the branches in opposite orders still agree', () => {
   // The convergence property, stated as a test because keep-the-first-seen fails it
   // silently. X meets the main branch first, Y meets the other first. Under any rule that

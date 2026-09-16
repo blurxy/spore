@@ -30,7 +30,7 @@ import { EventEmitter } from 'node:events';
 import { createPublicKey } from 'node:crypto';
 import {
   verifyBlock, decodeBlock, logIdMatches, hash256, HEADER_LEN, SIG_LEN,
-  TYPE, decodeGrant, decodeRevoke,
+  TYPE, decodeGrant, decodeRevoke, colonyIdFor,
 } from './block.js';
 import { Bitfield } from '../sharding/scheduler.js';
 
@@ -75,6 +75,11 @@ export const MAX_BYTES = 64 * 1024 * 1024;
  * (`logIdMatches`), and every block in the log is then verified under it — so a peer
  * cannot hand us a log claiming to be someone else's.
  */
+/**
+ * Block types eviction may never drop. See LogReplica#forgetOldest.
+ */
+const KEEP_FOREVER = new Set([TYPE.COLONY_GENESIS, TYPE.ROLE_GRANT, TYPE.ROLE_REVOKE]);
+
 export class LogReplica {
   constructor(logId, authorPub) {
     this.logId = Buffer.from(logId);
@@ -83,7 +88,16 @@ export class LogReplica {
     this.blocks = new Map(); // seq:number -> { cert, payload, hash, lamport }
     this.bits = new Bitfield(1); // held-set, grows with the log
     this.head = -1; // highest seq we hold
-    this.floor = 0; // lowest seq we might still hold; everything below is forgotten
+    this.floor = 0; // bottom of the chain-verifiable range; below it, only AUTHORITY is kept
+    // What sat at floor-1 before it was forgotten. Without these, the first recomputation
+    // after any eviction collapses the frontier back to the floor and never recovers:
+    // relink() restarts at `floor` and asks for its predecessor's hash and lamport, which
+    // eviction has just deleted. Measured before it was fixed: a 20-block log evicted to a
+    // floor of 15 kept linkedTo 19 until something forced a recompute, then dropped to 14
+    // and promoted nothing, permanently. Two 8/32-byte fields are the whole cost of not
+    // having to choose between forgetting and re-deriving.
+    this.floorHash = null;
+    this.floorLamport = 0n;
     this.bytes = 0;
     this.forgotten = 0;
     this.linkedTo = -1; // highest seq reachable by prev_hash from 0
@@ -104,12 +118,23 @@ export class LogReplica {
    *
    * Strictly below linkedTo: the frontier block itself is what relink() chains and derives
    * the next lamport from, so dropping it would stall the log permanently.
+   *
+   * CONTROL BLOCKS ARE NEVER DROPPED. The oldest block in a founder's log is its
+   * COLONY_GENESIS, so the plain rule hands the budget a way to launder a revocation:
+   * forget the genesis and the colony has no owner, so every member's authority claim
+   * stalls; forget a ROLE_REVOKE and the pin goes with it, so a demoted moderator's blocks
+   * link again. A spore that had simply been running long enough to reach its byte budget
+   * would re-admit everyone it had ever removed, silently. They are ~290 bytes each and
+   * they stay; the floor advances past them, so they sit below the chain-verifiable range
+   * as authority-only, which is exactly what they are once their neighbours are gone.
    */
   forgetOldest() {
     for (let s = this.floor; s < this.linkedTo; s++) {
       const b = this.blocks.get(s);
       this.floor = s + 1;
       if (!b) continue;
+      if (b.hash) { this.floorHash = b.hash; this.floorLamport = b.lamport; }
+      if (KEEP_FOREVER.has(b.type)) continue; // authority outlives the byte budget
       this.blocks.delete(s);
       if (s < this.bits.size && this.bits.has(s)) {
         this.bits.bits[s >> 3] &= ~(1 << (s & 7));
@@ -170,12 +195,16 @@ export class LogReplica {
       if (!b) break;
       const d = decodeBlock(b.cert);
 
+      // At the floor the predecessor has been forgotten, so its hash and lamport come from
+      // the witness kept when it went. Verified once, on arrival; not re-derivable now.
+      const prevHash = s === 0 ? null : (s === this.floor ? this.floorHash : this.hashAt(s - 1));
       const chained = s === 0
         ? d.prevHash.every((x) => x === 0)
-        : d.prevHash.equals(this.hashAt(s - 1) || Buffer.alloc(0));
+        : d.prevHash.equals(prevHash || Buffer.alloc(0));
       if (!chained) break; // a real break in the author's own chain; stop, do not skip it
 
-      let m = s === 0 ? 0n : this.blocks.get(s - 1).lamport;
+      let m = s === 0 ? 0n
+        : (s === this.floor ? this.floorLamport : this.blocks.get(s - 1).lamport);
       let stalled = false;
       for (const dep of d.deps) {
         const r = resolve(dep);
@@ -296,6 +325,10 @@ export class Substrate extends EventEmitter {
     let g;
     try { g = decodeGrant(at.block.payload); } catch { return 'stop'; }
     if (g.target.toString('hex') !== replica.key) return 'stop'; // somebody else's grant
+    // Revocation pins carry a scope, so grants must too, or the two are asymmetric: an
+    // owner of two colonies who removes someone from one has not removed them from the
+    // other, yet their grant in the first would still authorise writes in the second.
+    if (!at.block.scopeId.equals(d.scopeId)) return 'stop';
 
     const pins = this.auth.revokes.get(replica.key);
     if (pins) for (const pin of pins) if (pin.scope === scope && pin.pinSeq < seq) return 'stop';
@@ -314,19 +347,20 @@ export class Substrate extends EventEmitter {
     const owners = new Map();
     const pending = [];
     for (const r of this.logs.values()) {
-      for (let s = r.floor; s <= r.linkedTo; s++) {
-        const b = r.blocks.get(s);
-        if (!b) continue;
+      // Iterate what is HELD rather than the seq range: eviction keeps control blocks
+      // below the floor, and those are exactly the ones that must not stop counting.
+      for (const [seq, b] of r.blocks) {
         if (b.type !== TYPE.COLONY_GENESIS && b.type !== TYPE.ROLE_REVOKE) continue;
-        const d = decodeBlock(b.cert);
-        const scope = d.scopeId.toString('hex');
+        // Linked, or kept from below the floor — which was linked before it was forgotten.
+        if (seq > r.linkedTo && seq >= r.floor) continue;
         if (b.type === TYPE.COLONY_GENESIS) {
-          // Two genesis blocks for one scope is a malformed colony, not something to
-          // arbitrate. Lowest block hash wins, so every spore picks the same one.
-          const cur = owners.get(scope);
-          if (!cur || Buffer.compare(b.hash, cur.hash) < 0) owners.set(scope, { key: r.key, hash: b.hash });
+          // A colony names its own founder. A genesis whose scope_id is not the derived
+          // value is ignored outright — not tiebroken against the real one, because a
+          // tiebreak is a race and anyone can enter it with one cheap block.
+          if (!colonyIdFor(r.logId, seq).equals(b.scopeId)) continue;
+          owners.set(b.scopeId.toString('hex'), { key: r.key, hash: b.hash });
         } else {
-          pending.push({ author: r.key, scope, payload: b.payload });
+          pending.push({ author: r.key, scope: b.scopeId.toString('hex'), payload: b.payload });
         }
       }
     }
@@ -382,7 +416,6 @@ export class Substrate extends EventEmitter {
       round = [...this.logs.values()].filter((r) => r.pendingDeps);
       if (!round.length) break;
     }
-    for (const [r, seqs] of out) this.emit('linked', { logId: r.logId, seqs });
     return out;
   }
 
@@ -480,6 +513,7 @@ export class Substrate extends EventEmitter {
       hash: b.blockHash,
       lamport: b.lamport,
       type: b.type,
+      scopeId: Buffer.from(b.scopeId),
       bytes,
     });
     r.bytes += bytes;
@@ -493,19 +527,22 @@ export class Substrate extends EventEmitter {
     this.emit('block', { logId: r.logId, seq, from, block: b, payload });
 
     const moved = this.#relinkAll(r);
-    let promoted = moved.get(r) || [];
 
     // A control block that just linked can change who may write what, anywhere — including
     // in logs whose frontiers are already past the point it governs. #relinkAll only walks
     // forward, so it cannot take anything back; this is the same hole the fork cascade had.
-    if (this.#linkedAuthority(moved)) {
-      this.#resolveFrontiers();
-      // Report only what actually survived the recomputation. Telling a caller a block
-      // linked and then retracting it in the same call is worse than never saying so.
-      promoted = promoted.filter((x) => x <= r.linkedTo);
+    if (this.#linkedAuthority(moved)) this.#resolveFrontiers();
+
+    // 'linked' is announced only for what SURVIVED that, and only after it. Emitting on
+    // the way through and retracting in the same call would put a message on screen and
+    // take it off again before insert() returned — true to the internals, useless to a
+    // reader, and indistinguishable from a flicker bug.
+    for (const [rep, seqs] of moved) {
+      const alive = seqs.filter((x) => x <= rep.linkedTo);
+      if (alive.length) this.emit('linked', { logId: rep.logId, seqs: alive });
     }
     this.#trim();
-    return { ok: true, seq, linked: promoted };
+    return { ok: true, seq, linked: (moved.get(r) || []).filter((x) => x <= r.linkedTo) };
   }
 
   /**

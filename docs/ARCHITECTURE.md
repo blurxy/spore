@@ -1022,6 +1022,44 @@ Three consequences, recorded rather than fixed:
 Block type numbers follow `design/design-substrate.md` (`0x20-26`), not `ENCRYPTION.md`, whose
 `0x31 MEMBER_LEAVE` collides with `design-substrate.md`'s `0x31 STATE_SNAPSHOT`.
 
+**R4a. `colony_id = BLAKE2b(founder_log_id ‖ genesis_seq)[0..16]`, a spec addition.**
+
+R4 makes "is this block's author the colony owner" load-bearing, and `design-substrate.md`
+defines `scope_id` only as "colony_id or fruiting_id" — it never says how a colony_id is
+derived. Left underived, ownership is decided by comparing two blocks anyone can write: a
+fresh identity mints `COLONY_GENESIS` with `scope_id = C`, which chains, derives its lamport
+and claims no authority, so it links — and about half the time its hash sorts below the real
+founder's and takes the colony. Its revocations start counting; the founder's grants stop,
+because they no longer come from the owner. One cheap block, whole colony locked out, every
+spore agreeing.
+
+The derivation follows the spec's own `fruiting_id = BLAKE2b(colony_id ‖ creator_log_id ‖
+seq)[0..16]`, minus the parent a colony does not have, and is the same discipline as
+`log_id = BLAKE2b(author_pub)[0..16]`: the name carries its own proof. A genesis whose
+`scope_id` is not the derived value is **ignored**, not arbitrated against the real one — a
+tiebreak is a race, and anyone can enter it. Two genesis blocks for one scope then require one
+founder to have signed both at one seq, which is equivocation, and the log already ends there.
+
+**R4b. Eviction may never drop `COLONY_GENESIS`, `ROLE_GRANT` or `ROLE_REVOKE`.**
+
+The byte budget forgets the oldest linked blocks first, and the oldest block in a founder's log
+is its `COLONY_GENESIS`. Under the plain rule the budget becomes a laundering channel: forget
+the genesis and the colony has no owner, so every member's authority claim stalls; forget a
+`ROLE_REVOKE` and its pin goes with it, so the demoted moderator's blocks link again. A spore
+would re-admit everyone it had ever removed for no reason except having been running a while,
+and nothing would report it. Control blocks are ~290 bytes and they stay; the floor advances
+past them and they sit below the chain-verifiable range as authority-only, which is what they
+are once their neighbours are gone.
+
+Found with them, in code that predates all of this: **a frontier collapsed on the first
+recomputation after any eviction.** `relink()` restarts at `floor` and needs its predecessor's
+hash and lamport, which eviction had deleted. It never fired because a full recompute only ran
+on a fork and no eviction test forked — authority made recomputation routine. A 20-block log
+evicted to floor 15 held `linkedTo 19` until something forced a recompute, then fell to 14 and
+promoted nothing, permanently. The replica now keeps the hash and lamport of the block it
+forgot at the floor: 40 bytes, and the difference between forgetting old history and forgetting
+everything above it.
+
 ## Open Decisions
 
 These require a human call; each has options and a recommendation, not a default.
