@@ -209,6 +209,13 @@ beacon.on('peer', (peer) => {
   if (mgr.shouldDial(peer.sporeId)) mgr.dial(peer);
 });
 
+// --dial host:port — skip discovery entirely and connect to one peer by hand. Repeatable.
+// There to tell "multicast did not get through" apart from "the mesh is broken"; see
+// HyphaManager#dialAddr. shouldDial is deliberately bypassed: an explicit instruction is
+// not a race to lose.
+const DIAL = argv.reduce((acc, a, i) => (a === '--dial' && argv[i + 1] && !argv[i + 1].startsWith('--')
+  ? [...acc, argv[i + 1]] : acc), []);
+
 // --- run --------------------------------------------------------------------------
 const screen = HEADLESS ? null : new Screen(process.stdout);
 const glass = GLASS ? new Glass(tel, { nick: NICK, sporeId: sporeId.toString('hex'), port: GLASS }) : null;
@@ -218,6 +225,16 @@ async function main() {
   await mgr.listen();
   await beacon.start();
   sync.start();
+
+  for (const at of DIAL) {
+    const ix = at.lastIndexOf(':'); // lastIndexOf, so a bare IPv6 address is not cut in half
+    const host = ix > 0 ? at.slice(0, ix) : at;
+    const port = ix > 0 ? Number(at.slice(ix + 1)) : PORT;
+    console.log(`DIAL ${host}:${port}`);
+    mgr.dialAddr(host, port).then((h) => {
+      if (!h) console.log(`DIAL ${host}:${port} failed — see hypha.dial_failed above`);
+    });
+  }
   if (glass) {
     const at = await glass.listen();
     // Printed even in the TUI, where it scrolls past above the alt-screen — the address is

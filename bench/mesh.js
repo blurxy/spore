@@ -132,6 +132,13 @@ const log = (s) => console.log(`${String(Math.round(tel.ms())).padStart(7)}ms  $
 beacon.on('peer', (peer) => {
   if (mgr.shouldDial(peer.sporeId)) mgr.dial(peer);
 });
+
+// --dial host:port — repeatable. Discovery is multicast and Termux has no MulticastLock, so
+// phone-to-phone may never discover even where sync works perfectly. Without this, that
+// failure and a genuinely broken mesh look identical, and the whole measurement is blocked
+// on a device you may not get back. See HyphaManager#dialAddr.
+const DIAL = argv.reduce((acc, a, i) => (a === '--dial' && argv[i + 1] && !argv[i + 1].startsWith('--')
+  ? [...acc, argv[i + 1]] : acc), []);
 mgr.on('hypha', (h) => {
   log(`hypha  ${Buffer.from(h.peerId).toString('hex').slice(0, 8)}  live=${mgr.hyphae.size}`);
 });
@@ -143,6 +150,16 @@ async function main() {
   await mgr.listen();
   await beacon.start();
   sync.start();
+
+  for (const at of DIAL) {
+    const ix = at.lastIndexOf(':');
+    const host = ix > 0 ? at.slice(0, ix) : at;
+    const port = ix > 0 ? Number(at.slice(ix + 1)) : PORT;
+    console.log(`DIAL ${host}:${port}`);
+    mgr.dialAddr(host, port).then((h) => {
+      if (!h) console.log(`DIAL ${host}:${port} FAILED — discovery aside, this peer is unreachable`);
+    });
+  }
 
   console.log(`SPORE HARNESS  corpus=${CORPUS}  log=${KEY.slice(0, 12)}  port=${PORT}`);
 

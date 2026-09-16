@@ -328,6 +328,33 @@ export class HyphaManager extends EventEmitter {
     }
   }
 
+  /**
+   * Dial an address nobody announced.
+   *
+   * Discovery is multicast, and multicast is the part of this stack most likely to be the
+   * thing that is broken rather than the mesh. Termux has no MulticastLock (ARCHITECTURE
+   * §1.4), so a phone may transmit HELLO and never receive one. That still works against a
+   * laptop, because beacon.js answers a HELLO it hears with a UNICAST reply and the laptop
+   * heard the phone — but phone-to-phone, neither hears the other, neither replies, and
+   * nobody dials. docs/TERMUX.md then reads that as "the network, not the mesh", which is
+   * indistinguishable from the MulticastLock gap and from AP isolation.
+   *
+   * This splits one ambiguous blocked step into two separate findings: does DISCOVERY work
+   * on this device, and does SYNC work over this cell. It is a diagnostic, not a transport
+   * — the LAN allowlist in dial() still applies, so it cannot reach off the local network.
+   *
+   * The spore_id is a placeholder: it keys the in-flight dedup set only, and #adopt rekeys
+   * on hs.peerId once the handshake says who actually answered.
+   */
+  async dialAddr(host, port) {
+    return this.dial({
+      sporeId: Buffer.alloc(16),
+      addrs: [host],
+      from: host,
+      tcpPort: Number(port) || this.port,
+    });
+  }
+
   async dial(peer) {
     const key = peer.sporeId.toString('hex');
     if (this.stopping) return null;

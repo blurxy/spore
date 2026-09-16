@@ -127,9 +127,12 @@ npm test
 Expect a few seconds of output ending in:
 
 ```
-ℹ pass 96
 ℹ fail 0
 ```
+
+**Read the `fail` line, not the `pass` line.** The pass count grows every time a test is
+added — it was 96 when this was written and is 110 now — so a number here goes stale and
+then this step tells you to stop when nothing is wrong. `fail 0` is the check.
 
 This is the version check that means something. If every test passes, the protocol,
 BLAKE2b, ed25519, Noise, the substrate and the scheduler all work on this device's Node —
@@ -186,7 +189,30 @@ node bin/spore.js --nick beta
 ```
 
 Within a few seconds each should log the other as `SPORE ... is out there`, then `FUSED`.
-If they never see each other, it is the network, not the mesh. Go back and check isolation.
+
+**If they never see each other, do NOT conclude it is the network.** Three different things
+produce that exact symptom and only one of them is your router:
+
+1. AP isolation is on (the router).
+2. They are on different APs or bands (the router).
+3. The phone cannot RECEIVE multicast. Termux has no `MulticastLock` — see
+   ARCHITECTURE.md §1.4 — so a phone can transmit its HELLO and never hear anyone else's.
+   Against a laptop this still works, because the laptop hears the phone and answers
+   unicast. Phone-to-phone, neither hears the other and nobody dials.
+
+Tell them apart by skipping discovery entirely. Find one phone's address with `ifconfig`
+(or `ip addr`), then from the other:
+
+```sh
+node bin/spore.js --nick beta --dial 192.168.1.50:47474
+```
+
+Expect `DIAL 192.168.1.50:47474` and then `FUSED` within a second or so.
+
+- **It fuses** — sync and the radios are fine and discovery is the broken part. That is a
+  real finding about Android multicast, not a setup failure, and the harness in step 7 takes
+  `--dial` too, so the measurement can go ahead.
+- **It does not fuse** — now it really is the network. Go back and check AP isolation.
 
 ---
 
@@ -221,7 +247,7 @@ in the room, and the harness will say so.
 | `pkg: command not found` | Not Termux — probably a different terminal app |
 | `Unable to locate package nodejs-lts` | Play Store Termux. Uninstall, get the F-Droid build |
 | `termux-wake-lock: command not found` | `pkg install termux-api`, **and** install the Termux:API app |
-| Phones never see each other | AP isolation is on, or they are on different APs/bands |
+| Phones never see each other | AP isolation, different APs/bands, **or Android multicast receive** — use `--dial` (step 6) to tell them apart |
 | A run stalls and resumes | The wakelock was not held, or an OEM battery manager killed it |
 | `does not look like a v2 bundle file` | Truncated copy. Recopy the bundle |
 | The glass page is blank | Wrong device — `127.0.0.1` means the phone running the spore |
