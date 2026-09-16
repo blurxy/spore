@@ -125,6 +125,44 @@ test('wire: a seq above MAX_SEQ is refused before anything is sized from it', ()
   assert.throws(() => decodePairs(bad), /seq_out_of_range/);
 });
 
+test('store: a block seq above MAX_SEQ is refused, not sized into a Bitfield', () => {
+  // The sibling of the test above, and the hole it left. MAX_SEQ exists, in wire.js's own
+  // words, so that a peer cannot send a handful of well-formed bytes claiming a block at
+  // 4,294,967,295 and have the receiver allocate a 512 MB Uint8Array — "on a phone that is
+  // not a slowdown, it is the process."
+  //
+  // That bound was enforced on decodePairs and decodeHave, which carry a bare seq in the
+  // envelope. It was never enforced on BLOCK, where the seq lives inside the signed cert
+  // and so never passes through decodePairs at all — the one message type that actually
+  // sizes LogReplica#bits, and the highest-volume one on the wire.
+  //
+  // The check belongs in insert() rather than in decodeBlockMsg because insert() is the
+  // single funnel: every block reaches it, whether from a hypha, a disk replay, or a test.
+  const id = identity();
+  const seq = 5_000_000_000; // ~300x MAX_SEQ; ceil((seq+1)/8) is a ~596 MB request
+  const { cert } = encodeBlock(
+    {
+      type: TYPE.MESSAGE,
+      flags: FLAG.PAYLOAD_INLINE,
+      logId: id.logId,
+      seq,
+      lamport: 1n,
+      prevHash: Buffer.alloc(32),
+      payload: Buffer.alloc(0),
+    },
+    id.kp.privateKey,
+  );
+
+  const store = new Substrate();
+  const res = store.insert(cert, Buffer.alloc(0), id.pub);
+  assert.equal(res.ok, false, `seq ${seq} is ${Math.round(seq / MAX_SEQ)}x MAX_SEQ and must be refused`);
+  assert.equal(res.reason, 'seq_range');
+  assert.equal(store.logs.size, 0, 'and no replica is created for it');
+
+  // The boundary itself stays legal — the bound is a ceiling, not an off-by-one.
+  assert.ok(Number.isSafeInteger(MAX_SEQ));
+});
+
 test('wire: BLOCK carries the author key alongside the cert', () => {
   const id = identity();
   const [b0] = chain(id, 1);

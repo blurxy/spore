@@ -33,6 +33,11 @@ import {
   TYPE, decodeGrant, decodeRevoke, colonyIdFor,
 } from './block.js';
 import { Bitfield } from '../sharding/scheduler.js';
+// MAX_SEQ is a wire constant, but the thing it protects lives here: seq sizes LogReplica#bits.
+// It is enforced at insert() rather than at decode, because insert() is the single funnel every
+// block passes through — hypha, disk replay or test — and a bound checked on one transport is a
+// bound one new transport silently loses.
+import { MAX_SEQ } from '../sharding/wire.js';
 
 export const CERT_MIN = HEADER_LEN + SIG_LEN;
 
@@ -715,6 +720,12 @@ export class Substrate extends EventEmitter {
       return { ok: false, reason: `decode: ${e.message}` };
     }
 
+    // Before anything is allocated. seq sizes LogReplica#bits, and ensure() below creates a
+    // replica keyed by a log_id the sender chose — so the free check goes first, or a block
+    // that is about to be refused has already cost us an allocation.
+    const seq = Number(d.seq);
+    if (!Number.isSafeInteger(seq) || seq < 0 || seq > MAX_SEQ) return { ok: false, reason: 'seq_range' };
+
     const r = this.ensure(d.logId, authorPub);
     if (!r) return { ok: false, reason: 'log_author_mismatch' };
 
@@ -728,8 +739,9 @@ export class Substrate extends EventEmitter {
     }
     const b = v.block;
 
-    const seq = Number(b.seq);
-    if (!Number.isSafeInteger(seq) || seq < 0) return { ok: false, reason: 'seq_range' };
+    // The signed seq must be the one we bounds-checked above; decode and verify read the
+    // same field, and a mismatch would mean the two disagree about the cert's own layout.
+    if (Number(b.seq) !== seq) return { ok: false, reason: 'seq_range' };
 
     const prior = r.blocks.get(seq);
     if (prior) {
