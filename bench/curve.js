@@ -18,12 +18,14 @@
 // Control B does not keep gaining where the capped run flattens, the cap is not what
 // bends the curve and the model is wrong.
 //
-// RATES ARE SCALED DOWN 10x FROM REAL WI-FI, deliberately and for a measured reason:
-// src/substrate/blake2b.js does ~3.5 MB/s (BigInt, chosen for correctness over speed).
-// A joiner hashes every byte to verify payload_hash, so at true Wi-Fi rates sync would be
-// HASH-bound at every N — flat from N=1, which looks exactly like the thesis failing when
-// it is really a CPU limit. Curve SHAPE is scale-invariant, so the 3.3x and the N≈5 knee
-// survive the scaling intact. The hash ceiling is reported as its own finding.
+// RATES ARE REAL WI-FI RATES, and getting here took a fix.
+//
+// The first run of this benchmark was scaled 10x down, because blake2b256 was BigInt at
+// ~3.5 MB/s and a joiner hashes every byte it verifies — so at true rates sync would have
+// been HASH-bound at every N, flat from N=1, looking exactly like the thesis failing when
+// it was really a CPU limit. That finding drove the 32-bit-pair rewrite: blake2b256 now
+// does 37.7 MB/s, which clears the 25 MB/s cell, so the network binds first and these
+// numbers mean what they say. Margin is only ~1.5x, so this stays worth watching.
 
 import { Bitfield, FetchScheduler } from '../src/sharding/scheduler.js';
 import { Canvas, rgb, mix } from '../src/ui/canvas.js';
@@ -31,7 +33,7 @@ import { Canvas, rgb, mix } from '../src/ui/canvas.js';
 const DIV = '⊰-•-•⟐•-•-⦑/Λ\\Ο/Β\\Ε/\\Π/Λ\\Ι/Ν\\Υ/⦒-•-•⟐•-•-⊱';
 
 // ---- the model, all of it stated so it can be attacked ------------------------------
-const SCALE = 10;                              // see header
+const SCALE = 1;                               // real rates now — see header
 const BLOCK = 256 * 1024;                      // 256 KiB, per design-sharding
 const PAYLOAD_MB = 50;
 const TOTAL_BLOCKS = Math.round((PAYLOAD_MB * 1024 * 1024) / BLOCK);
@@ -254,7 +256,7 @@ const rule = () => console.log(`${C.cyan}${DIV}${C.off}`);
 console.log(`\n${C.mag}  ░▒▓ 5P0R3 // TH3 F4L51F13R ▓▒░${C.off}`);
 rule();
 pulse(`payload ${PAYLOAD_MB} MB · ${TOTAL_BLOCKS} blocks × ${BLOCK / 1024} KiB`);
-pulse(`uplink ${fmt(mb(UPLINK), 2)} MB/s · cell ${fmt(mb(CELL), 2)} MB/s · rates scaled ${SCALE}x down (see header)`);
+pulse(`uplink ${fmt(mb(UPLINK), 2)} MB/s · cell ${fmt(mb(CELL), 2)} MB/s · real Wi-Fi rates`);
 pulse('falsifier declared BEFORE running:');
 pulse('  (1) N=20 single-joiner must be within ~20% of N=5 — if it keeps climbing, the shared-medium model is wrong');
 pulse('  (2) Control B (no cell cap) must keep gaining where the capped run flattens — else the cap is not what bends it');
@@ -343,8 +345,9 @@ console.log(`  ${bKeepsGaining ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`
 console.log(`  ${churnRatio <= 2 ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`} churn — cohort within 2x of clean (${fmt(churnRatio, 2)}x)`);
 console.log();
 console.log(`${C.dim}  ARCHITECTURE.md §3 predicts 3.3x saturating near N=5. Measured peak: ${fmt(Math.max(...rows.map((r) => r.speedup)), 2)}x${C.off}`);
-console.log(`${C.warn}  FINDING: blake2b256 is BigInt (~3.5 MB/s). At true Wi-Fi rates sync is hash-bound,`);
-console.log(`  not network-bound. Rates here are scaled ${SCALE}x down so the network is the`);
-console.log(`  constraint under test. The 32-bit-pair rewrite is required before SP2.${C.off}`);
+console.log(`${C.dim}  RESOLVED: an earlier run of this benchmark was scaled 10x down because blake2b256`);
+console.log(`  was BigInt at ~3.5 MB/s and would have been the bottleneck instead of the network.`);
+console.log(`  The 32-bit-pair rewrite took it to 37.7 MB/s, clearing the 25 MB/s cell, so these`);
+console.log(`  are real rates. Margin is only ~1.5x — worth re-checking if block size grows.${C.off}`);
 rule();
 console.log();

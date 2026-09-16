@@ -48,16 +48,17 @@ against a token-bucket model with a shared Wi-Fi cell cap, and declares its fals
 *before* the run so the result cannot be rationalised afterwards.
 
 ```
-   N   sync      speedup
-   1   66.5s      1.00x
-   2   33.3s      1.99x
-   3   23.1s      2.88x
-   4   20.2s      3.29x   <- the knee
-  20   20.5s      3.25x   <- flat
+   N   sync     speedup      (50 MB history, real Wi-Fi rates)
+   1   6.5s      1.00x
+   2   3.2s      2.04x
+   3   2.1s      3.05x
+   4   1.9s      3.47x
+   5   1.8s      3.59x   <- the knee
+  20   1.8s      3.59x   <- flat
 ```
 
 `ARCHITECTURE.md` §3 predicted **3.3x saturating near N=5**, from arithmetic, before any
-code existed. Measured: **3.29x saturating at N=4**. All three falsifiers pass:
+code existed. Measured: **3.59x saturating at N=5**. All three falsifiers pass:
 
 - capped curve flat from N=5 to N=20 (3.24x → 3.25x) — the medium binds, as predicted
 - uncapped control keeps gaining (4.83x → 5.97x) — so supply really does scale, and the
@@ -66,10 +67,12 @@ code existed. Measured: **3.29x saturating at N=4**. All three falsifiers pass:
 
 Two findings the benchmark produced that the design did not have:
 
-- **At real Wi-Fi rates, sync is hash-bound, not network-bound.** `blake2b256` is BigInt
-  at ~3.5 MB/s and a joiner hashes every byte it verifies. Benchmark rates are scaled 10x
-  down so the network is the constraint under test. The 32-bit-pair rewrite is required
-  before SP2, and the oracle test exists now to make that safe.
+- **The hash was nearly the real bottleneck, and the benchmark caught it.** The first run
+  had to be scaled 10x down because `blake2b256` was BigInt at ~3.5 MB/s — a joiner hashes
+  every byte it verifies, so at true rates sync would have been hash-bound at every N,
+  flat from N=1, looking exactly like the thesis failing. The 32-bit-pair rewrite took it
+  to **37.7 MB/s**, clearing the 25 MB/s cell, so the numbers above are real rates. The
+  oracle test is what made that rewrite safe to attempt. Margin is only ~1.5x.
 - **Churn costs completion, not speed.** At one departure every 2s, survivors stayed fast
   (1.10x) but only 3 of 10 joiners ever finished. The swarm does not degrade gracefully;
   it degrades by losing people.
