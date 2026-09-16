@@ -36,7 +36,7 @@ import { EventEmitter } from 'node:events';
 import { FetchScheduler, Bitfield } from './scheduler.js';
 import {
   MSG, encodeHave, decodeHave, encodePairs, decodePairs,
-  encodeBlockMsg, decodeBlockMsg, msgType, WireError,
+  encodeBlockMsg, decodeBlockMsg, encodeForkProof, decodeForkProof, msgType, WireError,
 } from './wire.js';
 import { CERT_MIN } from '../substrate/store.js';
 
@@ -94,8 +94,40 @@ export class Syncer extends EventEmitter {
     this.timer = null;
     this.stats = { requested: 0, served: 0, received: 0, noblock: 0, cancelled: 0, timedOut: 0, released: 0 };
 
+    // Forks we have already told the mesh about, keyed `logHex:seq`. Bounded by the
+    // number of distinct forks that actually exist, which only an author can create.
+    this.forksAnnounced = new Set();
+
     this.mgr.on('hypha', (h) => this.#onHypha(h));
     this.mgr.on('message', ({ hypha, payload }) => this.#onMessage(hypha, payload));
+    this.store.on('equivocation', (e) => this.#gossipFork(e));
+  }
+
+  /**
+   * Tell everyone, exactly once per fork.
+   *
+   * Announcing is not optional. A fork seen by one spore is a fork the colony does not
+   * know about, and every replica that has not seen it keeps linking forward along a
+   * branch the author has already contradicted. Once-per-fork is what keeps this from
+   * echoing: receiving a proof records the fork, which emits 'equivocation', which lands
+   * back here — and stops, because the key is already in the set.
+   */
+  #gossipFork({ logId, seq, certA, certB }) {
+    const key = `${Buffer.from(logId).toString('hex')}:${seq}`;
+    if (this.forksAnnounced.has(key)) return;
+    this.forksAnnounced.add(key);
+    const r = this.store.replica(Buffer.from(logId).toString('hex'));
+    if (!r || !certA || !certB) return;
+    let body;
+    try {
+      body = encodeForkProof(certA, certB, r.authorPub);
+    } catch {
+      return; // two oversize certs; the local stop still holds, we just cannot relay it
+    }
+    for (const h of this.mgr.hyphae.values()) {
+      try { h.send(body); } catch { /* gone */ }
+    }
+    this.tel?.count('sync.fork_proof.sent');
   }
 
   start() {
@@ -164,7 +196,25 @@ export class Syncer extends EventEmitter {
     this.peerInflight.set(peer, 0);
     hypha.on('close', () => this.#dropPeer(peer));
     this.sendHave(hypha);
+    this.sendForks(hypha);
     this.pump();
+  }
+
+  /**
+   * Replay every fork we know to a hypha that just came up.
+   *
+   * `#gossipFork` broadcasts once, to whoever is connected at the time. For a spore that
+   * discovered a fork alone — or before anyone arrived — that broadcast reached nobody,
+   * and the once-per-fork guard means it is never sent again. The new peer would keep
+   * linking forward along a branch we have proof is contradicted, and would have no way
+   * to find out. Announce-once is only safe when it is paired with replay-on-connect.
+   */
+  sendForks(hypha) {
+    for (const f of this.store.knownForks()) {
+      try {
+        hypha.send(encodeForkProof(f.certA, f.certB, f.authorPub));
+      } catch { /* oversize or gone; the local stop still holds */ }
+    }
   }
 
   /**
@@ -222,6 +272,7 @@ export class Syncer extends EventEmitter {
         case MSG.BLOCK: return this.#recvBlock(peer, body);
         case MSG.CANCEL: return; // we are the server side; serving a cancelled block is harmless
         case MSG.NOBLOCK: return this.#recvNoblock(peer, body);
+        case MSG.FORK_PROOF: return this.#recvForkProof(body);
         default:
           this.tel?.count('sync.unknown_type');
           return;
@@ -314,6 +365,19 @@ export class Syncer extends EventEmitter {
     this.pump();
   }
 
+  #recvForkProof(body) {
+    const { authorPub, certA, certB } = decodeForkProof(body);
+    const res = this.store.acceptForkProof(certA, certB, authorPub);
+    if (!res.ok) {
+      // A proof that does not prove anything is a protocol violation by an authenticated
+      // peer, but not worth killing a hypha over — it costs us one verification.
+      this.tel?.count(`sync.fork_proof.reject.${res.reason}`);
+      return;
+    }
+    if (!res.duplicate) this.tel?.count('sync.fork_proof.accepted');
+    this.pump();
+  }
+
   #recvBlock(peer, body) {
     const { authorPub, cert, payload } = decodeBlockMsg(body);
     this.stats.received++;
@@ -367,10 +431,19 @@ export class Syncer extends EventEmitter {
     }
   }
 
-  /** How long this log is, as far as anyone present knows. Grows; never shrinks. */
+  /**
+   * How long this log is, as far as anyone present knows. Grows; never shrinks — except
+   * at a fork, where it stops for good.
+   *
+   * Past a fork there is nothing worth fetching. Those blocks can never link, because the
+   * frontier is pinned below the contradiction, so requesting them spends the swarm's
+   * airtime on history that is already known to be unusable. The log ends where the
+   * author stopped writing one.
+   */
   #totalFor(l, replica) {
     let t = replica ? replica.head + 1 : 0;
     for (const p of l.peers.values()) if (p.have.size > t) t = p.have.size;
+    if (replica && replica.forked) t = Math.min(t, replica.forkedAt);
     return t;
   }
 

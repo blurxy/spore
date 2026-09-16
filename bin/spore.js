@@ -138,7 +138,16 @@ substrate.on('linked', ({ logId: lid, seqs }) => {
 substrate.on('equivocation', ({ logId: lid, seq: s }) => {
   // The author signed two different blocks at one seq. Both signatures are valid, so this
   // is not a network fault — it is that spore contradicting itself, and it is permanent.
-  view.log('FORKED', `${lid.toString('hex').slice(0, 6)} signed twice at seq ${s}`, PAL.alarm);
+  // The log stops here for everyone who knows, which is why the proof gets passed on.
+  view.log('FORKED', `${lid.toString('hex').slice(0, 6)} signed twice at seq ${s} · log ends`, PAL.alarm);
+});
+
+// History we had accepted and can no longer stand behind. Saying so is the point: we
+// linked those blocks in good faith, then got proof the author was writing more than one
+// past. An interface that cannot show a retraction is one you cannot trust when it shows
+// nothing.
+substrate.on('retracted', ({ logId: lid, seqs }) => {
+  view.log('RETRACTED', `${lid.toString('hex').slice(0, 6)} · seq ${seqs[0]}–${seqs.at(-1)} withdrawn`, PAL.alarm);
 });
 
 sync.on('complete', ({ logId: lid, blocks }) => {

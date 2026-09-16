@@ -6,7 +6,8 @@
 // confidentiality claim for SP1 (the payloads inside are plaintext to any colony member
 // and the banner says so), it just avoids handing a passive observer free structure.
 //
-// Six messages. Five are obvious; NOBLOCK is the one that looks optional and is not.
+// Seven messages. Five are obvious; NOBLOCK is the one that looks optional and is not,
+// and FORK_PROOF is the one that keeps the substrate converging.
 //
 //   HAVE      here is everything I hold, per log, as a bitfield
 //   HAVE_ADD  I have just acquired (log, seq) — cache-on-fetch, announced
@@ -14,6 +15,7 @@
 //   BLOCK     here is one
 //   CANCEL    never mind, somebody beat you (endgame)
 //   NOBLOCK   I do not have that after all
+//   FORK_PROOF this author signed two different blocks at one seq, and here are both
 //
 // HAVE_ADD is where swarm supply growth becomes real rather than theoretical. A joiner
 // that fetches a block is instantly a source for it, but only if the rest of the swarm
@@ -25,6 +27,11 @@
 // reservation standing until a timeout, and under `plan()`'s documented contract a
 // stranded reservation blocks that index from ever being requested again. An explicit
 // "no" releases it in one round trip instead of one timeout.
+//
+// FORK_PROOF carries the two certificates an author signed at the same seq. Without it, a
+// spore that only ever meets one branch keeps a longer linked frontier than everyone who
+// met both, and never learns why. The substrate's answer to a fork is deterministic only
+// if every replica knows the fork exists.
 
 import { MAX_FRAME } from '../transport/tcp.js';
 
@@ -35,6 +42,7 @@ export const MSG = {
   BLOCK: 0x04,
   CANCEL: 0x05,
   NOBLOCK: 0x06,
+  FORK_PROOF: 0x07,
 };
 
 // The transport frame budget, minus what the hypha spends wrapping us: 8 bytes of
@@ -163,6 +171,41 @@ export function decodeBlockMsg(body) {
 /** Does a block of this size fit a single frame? Callers must ask before appending. */
 export function blockFits(certLen, payloadLen) {
   return 1 + 3 + PUB + 4 + 4 + certLen + payloadLen <= MAX_BODY;
+}
+
+/**
+ * FORK_PROOF: two certificates that cannot both be honest.
+ *
+ * Self-authenticating in the strongest sense available here — both signatures verify under
+ * a key that must hash to the log_id they claim, so the receiver needs no trust in whoever
+ * forwarded it. There is exactly one entity that can manufacture one of these, and it is
+ * the author, about themselves, once per fork.
+ */
+export function encodeForkProof(certA, certB, authorPub) {
+  const total = 1 + 3 + PUB + 4 + 4 + certA.length + certB.length;
+  if (total > MAX_BODY) throw new WireError('fork_proof_oversize');
+  const b = Buffer.alloc(total);
+  b.writeUInt8(MSG.FORK_PROOF, 0);
+  authorPub.copy(b, 4);
+  b.writeUInt32LE(certA.length, 4 + PUB);
+  b.writeUInt32LE(certB.length, 8 + PUB);
+  certA.copy(b, 12 + PUB);
+  certB.copy(b, 12 + PUB + certA.length);
+  return b;
+}
+
+export function decodeForkProof(body) {
+  const HEAD = 12 + PUB;
+  if (body.length < HEAD) throw new WireError('fork_proof_short');
+  const authorPub = body.subarray(4, 4 + PUB);
+  const aLen = body.readUInt32LE(4 + PUB);
+  const bLen = body.readUInt32LE(8 + PUB);
+  if (HEAD + aLen + bLen !== body.length) throw new WireError('fork_proof_length_mismatch');
+  return {
+    authorPub,
+    certA: body.subarray(HEAD, HEAD + aLen),
+    certB: body.subarray(HEAD + aLen, HEAD + aLen + bLen),
+  };
 }
 
 export function msgType(body) {

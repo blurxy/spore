@@ -97,7 +97,8 @@ export class LogReplica {
  * Events:
  *   'block'        { logId, seq, from, block, payload }  a block was accepted
  *   'linked'       { logId, seqs }                       blocks joined the verified chain
- *   'equivocation' { logId, seq, kept, rejected }        the author signed two blocks at one seq
+ *   'equivocation' { logId, seq, a, b }                  the author signed two blocks at one seq
+ *   'retracted'    { logId, seqs }                       linked history withdrawn behind a fork
  */
 export class Substrate extends EventEmitter {
   constructor({ telemetry = null } = {}) {
@@ -165,7 +166,7 @@ export class Substrate extends EventEmitter {
       // The author signed two different blocks at the same seq. This is not a network
       // fault and not something a peer can fake — both signatures verify under the
       // author's own key. We keep what we had, record the proof, and surface it.
-      const retracted = this.#recordFork(r, seq, prior.hash, b.blockHash);
+      const retracted = this.#recordFork(r, seq, prior.hash, b.blockHash, prior.cert, cert);
       return { ok: false, reason: 'equivocation', seq, retracted };
     }
 
@@ -187,6 +188,96 @@ export class Substrate extends EventEmitter {
     if (promoted.length) this.emit('linked', { logId: r.logId, seqs: promoted });
 
     return { ok: true, seq, linked: promoted };
+  }
+
+  /**
+   * The author signed two different blocks at one seq. Stop the log there, for everyone.
+   *
+   * The obvious handling — keep whichever arrived first, reject the other — is a
+   * CONVERGENCE BUG, and a quiet one. "First" is arrival order, and arrival order differs
+   * per spore. A spore that meets branch A first keeps A and links forward along it; a
+   * spore that meets branch B first keeps B and links forward along that. Each then
+   * rejects the other's blocks as equivocation, permanently. Two spores, both behaving
+   * correctly by that rule, hold different logs under the same log_id and never reconcile.
+   * The replicated log stops being replicated, and nothing reports an error.
+   *
+   * No choice of winner fixes it, because any rule that depends on what you saw first
+   * depends on the network. So the resolution is not to pick: the log ENDS at the fork.
+   * Hold both blocks, link neither, and stop the frontier at seq-1. Every spore that has
+   * seen both branches computes the same frontier from the same facts, with no vote, no
+   * coordinator, and no clock.
+   *
+   * This retracts history if we had already linked past it. That is the honest outcome
+   * and it is why 'retracted' exists: we accepted those blocks, and now we have proof the
+   * author was writing more than one history, so our confidence in that prefix was
+   * misplaced. A mesh that cannot say "I was wrong about this" is worse than one that can.
+   *
+   * A restore-from-backup equivocates innocently and is punished the same way. There is no
+   * way to distinguish it from malice without a clock, and off-web there is no clock.
+   */
+  #recordFork(r, seq, keptHash, otherHash, certA, certB) {
+    if (!r.forks.has(seq)) {
+      // The certs, not just the hashes. A fork proof is the two certificates — anyone can
+      // verify it alone — and we cannot produce one later from a digest.
+      r.forks.set(seq, { a: keptHash, b: otherHash, certA: Buffer.from(certA), certB: Buffer.from(certB) });
+    }
+    const retracted = [];
+    if (seq < r.forkedAt) {
+      r.forkedAt = seq;
+      for (let x = r.linkedTo; x >= seq; x--) retracted.push(x);
+      r.linkedTo = Math.min(r.linkedTo, seq - 1);
+    }
+    this.tel?.count('substrate.equivocation');
+    const f = r.forks.get(seq);
+    this.emit('equivocation', { logId: r.logId, seq, a: keptHash, b: otherHash, certA: f.certA, certB: f.certB });
+    if (retracted.length) {
+      this.tel?.count('substrate.retracted', retracted.length);
+      this.emit('retracted', { logId: r.logId, seqs: retracted.reverse() });
+    }
+    return retracted;
+  }
+
+  /**
+   * Record a fork we were TOLD about rather than witnessed.
+   *
+   * Both certs are self-authenticating: they carry signatures that verify under a key
+   * which must hash to the log_id they claim. So this needs no trust in the messenger —
+   * the proof is the thing, and a spore that has only ever seen one branch would
+   * otherwise keep a longer frontier than everyone else and never find out why.
+   */
+  acceptForkProof(certA, certB, authorPub) {
+    const va = verifyBlock(certA, edKeyOf(authorPub));
+    const vb = verifyBlock(certB, edKeyOf(authorPub));
+    if (!va.ok || !vb.ok) return { ok: false, reason: 'proof_bad_signature' };
+    if (!va.block.logId.equals(vb.block.logId)) return { ok: false, reason: 'proof_different_logs' };
+    if (va.block.seq !== vb.block.seq) return { ok: false, reason: 'proof_different_seq' };
+    if (va.block.blockHash.equals(vb.block.blockHash)) return { ok: false, reason: 'proof_same_block' };
+    if (!logIdMatches(va.block.logId, authorPub)) return { ok: false, reason: 'log_author_mismatch' };
+
+    const r = this.ensure(va.block.logId, authorPub);
+    if (!r) return { ok: false, reason: 'log_author_mismatch' };
+    const seq = Number(va.block.seq);
+    if (r.forks.has(seq)) return { ok: true, duplicate: true, seq };
+    this.#recordFork(r, seq, va.block.blockHash, vb.block.blockHash, certA, certB);
+    return { ok: true, seq };
+  }
+
+  /**
+   * Every fork we know about, as replayable proofs.
+   *
+   * A fork found before a peer arrived is a fork that peer never hears about, because the
+   * broadcast went out to an empty hypha set. Same shape of mistake as a full HAVE that is
+   * skipped on an empty store: an announcement made once, to whoever happened to be
+   * listening, is not a replicated fact. So proofs are replayed at hypha setup too.
+   */
+  knownForks() {
+    const out = [];
+    for (const r of this.logs.values()) {
+      for (const [seq, f] of r.forks) {
+        if (f.certA && f.certB) out.push({ logId: r.logId, authorPub: r.authorPub, seq, certA: f.certA, certB: f.certB });
+      }
+    }
+    return out;
   }
 
   /** Everything we hold, as HAVE advertisements. One entry per log. */

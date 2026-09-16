@@ -186,7 +186,104 @@ test('store: an author signing two blocks at one seq is detected, not silently a
   assert.equal(r.reason, 'equivocation');
   assert.equal(seen.length, 1);
   assert.equal(seen[0].seq, 3);
-  assert.ok(!seen[0].kept.equals(seen[0].rejected), 'two genuinely different blocks');
+  assert.ok(!seen[0].a.equals(seen[0].b), 'two genuinely different blocks');
+  assert.ok(seen[0].certA && seen[0].certB, 'the proof must carry the certs, not just hashes');
+});
+
+/** A log that forks at `at`: one chain, plus a second block signed at the same seq. */
+function forkedChain(id, n, at) {
+  const main = chain(id, n, 'main');
+  let prevHash = Buffer.alloc(32);
+  for (let i = 0; i < at; i++) {
+    prevHash = encodeBlock(
+      { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq: i,
+        lamport: i + 1, prevHash, payload: Buffer.from(`main ${i}`) },
+      id.kp.privateKey,
+    ).blockHash;
+  }
+  const payload = Buffer.from(`OTHER ${at}`);
+  const { cert } = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq: at,
+      lamport: at + 1, prevHash, payload },
+    id.kp.privateKey,
+  );
+  return { main, other: { cert, payload } };
+}
+
+test('store: two spores that meet the branches in opposite orders still agree', () => {
+  // The convergence property, stated as a test because keep-the-first-seen fails it
+  // silently. X meets the main branch first, Y meets the other first. Under any rule that
+  // depends on arrival order they end up holding different logs under the same log_id,
+  // forever, and nothing reports an error.
+  const id = identity();
+  const { main, other } = forkedChain(id, 8, 4);
+
+  const X = new Substrate();
+  for (const b of main) X.insert(b.cert, b.payload, id.pub);
+  X.insert(other.cert, other.payload, id.pub);
+
+  const Y = new Substrate();
+  Y.insert(other.cert, other.payload, id.pub);
+  for (const b of main) Y.insert(b.cert, b.payload, id.pub);
+
+  const rx = X.replica(id.logId.toString('hex'));
+  const ry = Y.replica(id.logId.toString('hex'));
+
+  assert.equal(rx.forkedAt, 4);
+  assert.equal(ry.forkedAt, 4);
+  assert.equal(rx.linkedTo, 3, 'the frontier stops below the contradiction');
+  assert.equal(ry.linkedTo, ry.linkedTo);
+  assert.equal(rx.linkedTo, ry.linkedTo, 'both agree despite opposite arrival order');
+});
+
+test('store: history linked past a fork is retracted when the fork turns up late', () => {
+  const id = identity();
+  const { main, other } = forkedChain(id, 8, 4);
+  const s = new Substrate();
+  const retracted = [];
+  s.on('retracted', (e) => retracted.push(...e.seqs));
+
+  for (const b of main) s.insert(b.cert, b.payload, id.pub);
+  const rep = s.replica(id.logId.toString('hex'));
+  assert.equal(rep.linkedTo, 7, 'the whole chain links while only one branch is known');
+
+  s.insert(other.cert, other.payload, id.pub);
+  assert.equal(rep.linkedTo, 3, 'and is withdrawn below the fork once it is known');
+  assert.deepEqual(retracted, [4, 5, 6, 7]);
+});
+
+test('store: a fork proof convinces a spore that only ever saw one branch', () => {
+  const id = identity();
+  const { main, other } = forkedChain(id, 8, 4);
+
+  const witness = new Substrate();
+  for (const b of main) witness.insert(b.cert, b.payload, id.pub);
+  let proof = null;
+  witness.on('equivocation', (e) => { proof = e; });
+  witness.insert(other.cert, other.payload, id.pub);
+  assert.ok(proof, 'the witness must be able to produce a proof');
+
+  // This spore has seen only the main branch and has no reason to doubt it.
+  const naive = new Substrate();
+  for (const b of main) naive.insert(b.cert, b.payload, id.pub);
+  const rep = naive.replica(id.logId.toString('hex'));
+  assert.equal(rep.linkedTo, 7);
+
+  const res = naive.acceptForkProof(proof.certA, proof.certB, id.pub);
+  assert.ok(res.ok, res.reason);
+  assert.equal(rep.linkedTo, 3, 'the proof alone is enough — no trust in the messenger');
+  assert.equal(naive.acceptForkProof(proof.certA, proof.certB, id.pub).duplicate, true);
+});
+
+test('store: a fork proof that does not prove a fork is refused', () => {
+  const id = identity();
+  const stranger = identity();
+  const blocks = chain(id, 3);
+  const s = new Substrate();
+
+  assert.equal(s.acceptForkProof(blocks[0].cert, blocks[0].cert, id.pub).reason, 'proof_same_block');
+  assert.equal(s.acceptForkProof(blocks[0].cert, blocks[1].cert, id.pub).reason, 'proof_different_seq');
+  assert.equal(s.acceptForkProof(blocks[0].cert, blocks[1].cert, stranger.pub).reason, 'proof_bad_signature');
 });
 
 test('store: a random log id has no author and is refused', () => {
@@ -321,6 +418,33 @@ test('sync: a spore that connects while empty is still discoverable as a source'
   assert.ok(middle.sync.stats.served > 0, 'middle must have re-served what it fetched');
 
   for (const s of [seeder, middle, tail]) { s.sync.stop(); await s.mgr.stop(); }
+});
+
+test('sync: a fork proof reaches a spore that connects long after the fork was found', async () => {
+  const author = identity();
+  const { main, other } = forkedChain(author, 12, 6);
+
+  // The witness finds the fork ALONE, before any hypha exists. Its broadcast goes to
+  // nobody, and the once-per-fork guard means it is never broadcast again. If proofs are
+  // not replayed at connect time, `naive` links all the way to 11 and stays there.
+  const witness = spore(47660, { seedFrom: { id: author, blocks: main } });
+  witness.store.insert(other.cert, other.payload, author.pub);
+  const naive = spore(47661, { seedFrom: { id: author, blocks: main } });
+
+  for (const s of [witness, naive]) await s.mgr.listen();
+  for (const s of [witness, naive]) s.sync.start();
+
+  const key = author.logId.toString('hex');
+  assert.equal(witness.store.replica(key).forkedAt, 6);
+  assert.equal(naive.store.replica(key).linkedTo, 11, 'naive has no reason to doubt yet');
+
+  await naive.mgr.dial({ sporeId: witness.id.pub, addrs: ['127.0.0.1'], tcpPort: 47660 });
+
+  const ok = await until(() => naive.store.replica(key).forkedAt === 6, 6000);
+  assert.ok(ok, 'the proof never arrived');
+  assert.equal(naive.store.replica(key).linkedTo, 5, 'and history above the fork is withdrawn');
+
+  for (const s of [witness, naive]) { s.sync.stop(); await s.mgr.stop(); }
 });
 
 test('sync: a peer that withers mid-transfer strands nothing', async () => {
