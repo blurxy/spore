@@ -1,0 +1,187 @@
+// Block certificate — the unit of truth in the substrate.
+//
+// 196-byte fixed header + deps + 64-byte signature, exactly per design-substrate.md.
+// The signature covers payload_hash, not the payload, so a 40MB video block is still a
+// 260-byte cert that SHARDING can fetch and verify independently of its bytes.
+
+import { createHash, sign as edSign, verify as edVerify, randomBytes } from 'node:crypto';
+
+export const HEADER_LEN = 196;
+export const SIG_LEN = 64;
+export const DEP_LEN = 32;
+
+// ---------------------------------------------------------------------------
+// DEVIATION FROM SPEC, DELIBERATE AND LOAD-BEARING
+//
+// design-substrate.md specifies BLAKE2b-256. Node 24 exposes only blake2b512 and
+// blake2s256 — there is no parameterized-output BLAKE2b. We therefore use
+// BLAKE2b-512 truncated to 32 bytes.
+//
+// This is a secure 256-bit hash, but it is NOT the same function as BLAKE2b-256:
+// BLAKE2b parameterizes its IV with the digest length, so real BLAKE2b-256 produces
+// different bytes for the same input. A second SPORE implementation written from the
+// spec alone would compute different block_hashes and fail to interop.
+//
+// Recorded here rather than fixed silently. Options at SP2: amend the spec to say
+// "BLAKE2b-512 truncated", or ship a ~120-line BLAKE2b core to get true 256.
+// ---------------------------------------------------------------------------
+export function hash256(...parts) {
+  const h = createHash('blake2b512');
+  for (const p of parts) h.update(p);
+  return h.digest().subarray(0, 32);
+}
+
+export const TYPE = {
+  IDENTITY: 0x01,
+  DEVICE_LINK: 0x02,
+  COLONY_GENESIS: 0x10,
+  FRUITING_CREATE: 0x11,
+  MEMBER_JOIN: 0x20,
+  AUTH_SNAPSHOT: 0x30,
+  MESSAGE: 0x40,
+  EDIT: 0x41,
+  DELETE: 0x42,
+};
+
+export const FLAG = {
+  PAYLOAD_INLINE: 1 << 0,
+  ENCRYPTED: 1 << 1,
+  BATCH: 1 << 2,
+  SNAPSHOT_ANCHOR: 1 << 3,
+  REDACTED: 1 << 4,
+  AUTH_CONTROL: 1 << 5,
+};
+
+const ZERO16 = Buffer.alloc(16);
+const ZERO32 = Buffer.alloc(32);
+
+/**
+ * Encode a block certificate. Returns { cert, blockHash, payloadHash }.
+ * Signature is ed25519 over hash256(header || deps), so signing cost is independent
+ * of dep count and of payload size.
+ */
+export function encodeBlock(fields, privateKey) {
+  const {
+    type,
+    flags = 0,
+    logId,
+    seq,
+    lamport,
+    scopeId = ZERO16,
+    prevHash = ZERO32,
+    mmrRoot = ZERO32,
+    authRef = ZERO32,
+    payload = Buffer.alloc(0),
+    deps = [],
+  } = fields;
+
+  if (logId.length !== 16) throw new Error(`logId must be 16 bytes, got ${logId.length}`);
+  if (deps.some((d) => d.length !== DEP_LEN)) throw new Error('each dep must be 32 bytes');
+
+  const h = Buffer.alloc(HEADER_LEN);
+  h.writeUInt8(0x01, 0);
+  h.writeUInt8(type, 1);
+  h.writeUInt16LE(flags, 2);
+  logId.copy(h, 4);
+  h.writeBigUInt64LE(BigInt(seq), 20);
+  h.writeBigUInt64LE(BigInt(lamport), 28);
+  // wall_ms (offset 36) stays ZERO. Advisory-only per spec, and ARCHITECTURE.md 1.2
+  // removed all wall-clock dependence — off-web has no NTP, so we never even record it.
+  h.writeBigUInt64LE(0n, 36);
+  scopeId.copy(h, 44);
+  prevHash.copy(h, 60);
+  mmrRoot.copy(h, 92);
+  authRef.copy(h, 124);
+  hash256(payload).copy(h, 156);
+  h.writeUInt32LE(payload.length, 188);
+  h.writeUInt16LE(deps.length, 192);
+  h.writeUInt16LE(0, 194);
+
+  const depBytes = deps.length ? Buffer.concat(deps) : Buffer.alloc(0);
+  const signed = Buffer.concat([h, depBytes]);
+  const sig = edSign(null, hash256(signed), privateKey);
+  if (sig.length !== SIG_LEN) throw new Error(`unexpected sig length ${sig.length}`);
+
+  const cert = Buffer.concat([signed, sig]);
+  return { cert, blockHash: hash256(cert), payloadHash: h.subarray(156, 188) };
+}
+
+export function decodeBlock(cert) {
+  if (cert.length < HEADER_LEN + SIG_LEN) throw new Error('cert too short');
+  if (cert.readUInt8(0) !== 0x01) throw new Error(`unsupported block ver ${cert.readUInt8(0)}`);
+  const depCount = cert.readUInt16LE(192);
+  const want = HEADER_LEN + depCount * DEP_LEN + SIG_LEN;
+  if (cert.length !== want) throw new Error(`cert length ${cert.length}, expected ${want}`);
+
+  const deps = [];
+  for (let i = 0; i < depCount; i++) {
+    const o = HEADER_LEN + i * DEP_LEN;
+    deps.push(cert.subarray(o, o + DEP_LEN));
+  }
+  return {
+    ver: cert.readUInt8(0),
+    type: cert.readUInt8(1),
+    flags: cert.readUInt16LE(2),
+    logId: cert.subarray(4, 20),
+    seq: cert.readBigUInt64LE(20),
+    lamport: cert.readBigUInt64LE(28),
+    scopeId: cert.subarray(44, 60),
+    prevHash: cert.subarray(60, 92),
+    mmrRoot: cert.subarray(92, 124),
+    authRef: cert.subarray(124, 156),
+    payloadHash: cert.subarray(156, 188),
+    payloadLen: cert.readUInt32LE(188),
+    depCount,
+    deps,
+    sig: cert.subarray(want - SIG_LEN),
+    signedRegion: cert.subarray(0, want - SIG_LEN),
+    blockHash: hash256(cert),
+  };
+}
+
+/** Verify signature and, when the payload is supplied, that it matches payload_hash. */
+export function verifyBlock(cert, publicKey, payload = null) {
+  let b;
+  try {
+    b = decodeBlock(cert);
+  } catch (e) {
+    return { ok: false, reason: `decode: ${e.message}` };
+  }
+  if (!edVerify(null, hash256(b.signedRegion), publicKey, b.sig)) {
+    return { ok: false, reason: 'bad_signature' };
+  }
+  if (payload !== null) {
+    if (payload.length !== b.payloadLen) return { ok: false, reason: 'payload_len_mismatch' };
+    if (!hash256(payload).equals(b.payloadHash)) return { ok: false, reason: 'payload_hash_mismatch' };
+  }
+  return { ok: true, block: b };
+}
+
+/**
+ * ORDER(B) = (lamport, log_id lexicographic, seq).
+ * Total, because (log_id, seq) is globally unique. A pure function of block fields, so
+ * every spore computes the same order with no clock and no coordinator.
+ */
+export function order(a, b) {
+  if (a.lamport !== b.lamport) return a.lamport < b.lamport ? -1 : 1;
+  const c = Buffer.compare(a.logId, b.logId);
+  if (c !== 0) return c;
+  if (a.seq !== b.seq) return a.seq < b.seq ? -1 : 1;
+  return 0;
+}
+
+/**
+ * Lamport is DERIVED, never asserted: 1 + max(own previous, all deps).
+ * A spore recomputes this and rejects a block whose field disagrees, which closes the
+ * lamport-inflation attack — you cannot declare lamport = 2^60 and pin yourself atop
+ * history forever.
+ */
+export function deriveLamport(prevLamport, depLamports = []) {
+  let m = BigInt(prevLamport);
+  for (const d of depLamports) if (BigInt(d) > m) m = BigInt(d);
+  return m + 1n;
+}
+
+export function newLogId() {
+  return randomBytes(16);
+}

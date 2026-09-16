@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node bin/spore.js",
     "bench": "node bench/curve.js",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {}
 }
