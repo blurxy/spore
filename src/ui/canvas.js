@@ -21,13 +21,10 @@ export const ALT_SCREEN_OFF = '\x1b[?1049l';
 export const HIDE_CURSOR = '\x1b[?25l';
 export const SHOW_CURSOR = '\x1b[?25h';
 
-export const rgb = (r, g, b) => ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
-export const lerp = (a, b, t) => a + (b - a) * t;
-export const mix = (c1, c2, t) => rgb(
-  Math.round(lerp((c1 >> 16) & 255, (c2 >> 16) & 255, t)),
-  Math.round(lerp((c1 >> 8) & 255, (c2 >> 8) & 255, t)),
-  Math.round(lerp(c1 & 255, c2 & 255, t)),
-);
+// Colour lives in palette.js so the browser renderer can import it without a terminal
+// attached. Re-exported here because every existing caller imports it from canvas.js.
+export { rgb, lerp, mix, css } from './palette.js';
+import { mix } from './palette.js';
 
 export class Canvas {
   constructor(cols, rows) {

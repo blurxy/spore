@@ -13,7 +13,17 @@
 // few seconds and nothing answers. That shout is real, so the pulse that renders it is
 // honest, and the loneliest state in the product is also its most alive-looking.
 
-import { Canvas, rgb, mix } from './canvas.js';
+import { rgb, mix } from './palette.js';
+
+/**
+ * A peer id as hex, from whatever shape it arrived in.
+ *
+ * This file runs in two places now: Node, where ids arrive as Buffers, and a browser,
+ * where they arrive as hex strings over an event stream and there is no Buffer at all.
+ * `Buffer.from(x).toString('hex')` was the only thing in this module that could not.
+ */
+const hexOf = (id) => (typeof id === 'string' ? id
+  : Array.from(id, (b) => b.toString(16).padStart(2, '0')).join(''));
 
 // Palette. Deep substrate, cyan core, magenta tips — bioluminescent, and every value
 // checked for contrast against the substrate black rather than chosen by feel.
@@ -147,7 +157,7 @@ export class MyceliumView {
     };
 
     t.on('beacon.peer', (p) => {
-      const key = p.sporeId.toString('hex');
+      const key = hexOf(p.sporeId);
       if (!this.filaments.has(key)) {
         this.filaments.set(key, new Filament(key, this.#angleFor(), p.nick || key.slice(0, 6)));
         this.log('SPORE', `${p.nick || key.slice(0, 6)} is out there`, PAL.tip);
@@ -163,7 +173,7 @@ export class MyceliumView {
     });
 
     t.on('hypha.established', ({ peerId, sas }) => {
-      const key = Buffer.from(peerId).toString('hex');
+      const key = hexOf(peerId);
       let f = this.filaments.get(key);
       if (!f) {
         f = new Filament(key, this.#angleFor(), key.slice(0, 6));
@@ -173,11 +183,11 @@ export class MyceliumView {
       f.sas = sas;
       f.grown.to(1);
       f.fused = 1; // anastomosis: two hyphae from different spores becoming one network
-      this.log('FUSED', `${f.nick} · sas ${sas.toString('hex')}`, PAL.core);
+      this.log('FUSED', `${f.nick} · sas ${hexOf(sas)}`, PAL.core);
     });
 
     t.on('hypha.withered', ({ peerId, reason }) => {
-      const f = this.filaments.get(Buffer.from(peerId).toString('hex'));
+      const f = this.filaments.get(hexOf(peerId));
       if (!f) return;
       f.state = 'withered';
       f.grown.to(0);
@@ -319,7 +329,7 @@ export class MyceliumView {
     } else if (live > 0) {
       const sas = [...this.filaments.values()].find((f) => f.sas)?.sas;
       pulse = `L=${this.lamport} · ${live} hypha${live === 1 ? '' : 'e'}`
-        + (sas ? ` · sas ${sas.toString('hex')}` : '')
+        + (sas ? ` · sas ${hexOf(sas)}` : '')
         + ` · R V I F B sh4rd1ng`;
       pulseColour = PAL.core;
     } else {

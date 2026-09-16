@@ -94,6 +94,23 @@ export class Telemetry extends EventEmitter {
     return r ? r.ewma.value : 0;
   }
 
+  /**
+   * Has this row ever been measured at all?
+   *
+   * rateOf() and get() answer 0 for a row nobody has reported, which GROWTH.md §3.3
+   * explicitly forbids a RENDERER from showing: "a visual whose bind: string resolves to
+   * no telemetry row renders U+2298 (⊘) instead of a plausible default or a zero." Zero is
+   * the most plausible lie available — it draws a calm, idle mesh over a dead feed.
+   *
+   * Changing those two return values would be the deeper fix and is not done here, because
+   * they are read all over the transport and sharding layers where 0 is arithmetically
+   * what is wanted. So the distinction is offered additively: a consumer that must tell
+   * "quiet" from "unknown" asks, and the existing callers are untouched.
+   */
+  hasRate(name) { return this.rates.has(name); }
+
+  hasCounter(name) { return this.counters.has(name) || this.gauges.has(name); }
+
   get(name) {
     return this.counters.get(name) ?? this.gauges.get(name) ?? 0;
   }
