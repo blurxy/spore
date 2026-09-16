@@ -152,10 +152,12 @@ test('store: a log cannot be claimed by a key it does not name', () => {
   const [b0] = chain(alice, 1);
   const s = new Substrate();
 
-  // Mallory relays Alice's block but names himself as the author.
+  // Mallory relays Alice's block but names himself as the author. The log_id binding is
+  // now checked BEFORE the signature — which key may sign is a property of the log, not
+  // something the message gets to assert — so this is refused on the binding.
   const r = s.insert(b0.cert, b0.payload, mallory.pub);
   assert.equal(r.ok, false);
-  assert.equal(r.reason, 'bad_signature', 'his key does not verify her signature');
+  assert.equal(r.reason, 'log_author_mismatch', 'his key does not name her log');
 
   // And a block Mallory signed into a log id he does not own is refused on the binding.
   const { cert } = encodeBlock(
@@ -165,6 +167,57 @@ test('store: a log cannot be claimed by a key it does not name', () => {
   const r2 = s.insert(cert, Buffer.alloc(0), mallory.pub);
   assert.equal(r2.ok, false);
   assert.equal(r2.reason, 'log_author_mismatch');
+});
+
+test('store: a log ALREADY KNOWN cannot be written by anyone but its author', () => {
+  // The test above used a fresh Substrate, so the replica did not exist and the binding
+  // check ran on creation. That is the only path it ever ran on. Once a replica exists —
+  // i.e. always, after the first block — a second author could write into it freely.
+  // A log_id binding that stops applying after block zero is not a binding.
+  const alice = identity();
+  const mallory = identity();
+  const s = new Substrate();
+
+  const g = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: alice.logId, seq: 0,
+      lamport: 1, payload: Buffer.from('alice here') },
+    alice.kp.privateKey,
+  );
+  assert.ok(s.insert(g.cert, Buffer.from('alice here'), alice.pub).ok, 'genesis creates the replica');
+
+  // Mallory signs a block claiming ALICE's log id, under HIS OWN key, chained correctly
+  // onto her genesis. The signature is real — it is just not hers.
+  const evil = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: alice.logId, seq: 1,
+      lamport: 2, prevHash: g.blockHash, payload: Buffer.from('ALICE SAID THIS') },
+    mallory.kp.privateKey,
+  );
+  const r = s.insert(evil.cert, Buffer.from('ALICE SAID THIS'), mallory.pub);
+
+  assert.equal(r.ok, false, 'forging into an existing log must be refused');
+  const rep = s.replica(alice.logId.toString('hex'));
+  assert.equal(rep.has(1), false, 'and the forged block must not be stored');
+  assert.equal(rep.linkedTo, 0, 'and above all must not reach the linked chain');
+  assert.ok(rep.authorPub.equals(alice.pub), 'the replica still names alice');
+});
+
+test('store: knowing the real author key does not help a forger either', () => {
+  // Alice's public key is public. A forger supplies it honestly and signs with their own
+  // private key — so the fix cannot be "check the supplied key binds to the log id".
+  // Once a replica exists, its stored key is the only one that may verify anything.
+  const alice = identity();
+  const mallory = identity();
+  const s = new Substrate();
+  const [g] = chain(alice, 1);
+  assert.ok(s.insert(g.cert, g.payload, alice.pub).ok);
+
+  const evil = encodeBlock(
+    { type: TYPE.MESSAGE, logId: alice.logId, seq: 1, lamport: 2, payload: Buffer.alloc(0) },
+    mallory.kp.privateKey,
+  );
+  const r = s.insert(evil.cert, Buffer.alloc(0), alice.pub); // claims alice, signed by mallory
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'bad_signature');
 });
 
 test('store: an author signing two blocks at one seq is detected, not silently accepted', () => {
@@ -283,7 +336,31 @@ test('store: a fork proof that does not prove a fork is refused', () => {
 
   assert.equal(s.acceptForkProof(blocks[0].cert, blocks[0].cert, id.pub).reason, 'proof_same_block');
   assert.equal(s.acceptForkProof(blocks[0].cert, blocks[1].cert, id.pub).reason, 'proof_different_seq');
-  assert.equal(s.acceptForkProof(blocks[0].cert, blocks[1].cert, stranger.pub).reason, 'proof_bad_signature');
+
+  // A stranger cannot open a log they do not name, so the binding refuses before any
+  // signature is considered. (This used to report proof_bad_signature, because the
+  // signature was checked under the key the CALLER supplied — the same inversion that
+  // let forged blocks into other people's logs.)
+  const { main, other } = forkedChain(id, 4, 2);
+  const fresh = new Substrate();
+  assert.equal(fresh.acceptForkProof(main[2].cert, other.cert, stranger.pub).reason, 'log_author_mismatch');
+});
+
+test('store: a real fork proof is accepted no matter who relays it', () => {
+  // The flip side of the binding: once the log is known, its own stored key decides.
+  // A proof is a claim about an author contradicting themselves, and it verifies on its
+  // own terms — so the messenger's identity is irrelevant and may be anyone's.
+  const id = identity();
+  const stranger = identity();
+  const { main, other } = forkedChain(id, 6, 3);
+
+  const s = new Substrate();
+  for (const b of main) s.insert(b.cert, b.payload, id.pub);
+  assert.equal(s.replica(id.logId.toString('hex')).linkedTo, 5);
+
+  const res = s.acceptForkProof(main[3].cert, other.cert, stranger.pub);
+  assert.ok(res.ok, `a valid proof must stand on its own: ${res.reason}`);
+  assert.equal(s.replica(id.logId.toString('hex')).linkedTo, 2, 'and still stops the log');
 });
 
 test('store: a random log id has no author and is refused', () => {

@@ -263,13 +263,25 @@ export class Syncer extends EventEmitter {
     else l.inflightGlobal.set(seq, n - 1);
   }
 
+  /**
+   * End one outstanding request. Releases the global reservation ONLY if this peer
+   * actually held one.
+   *
+   * The unconditional version was exploitable. #recvBlock derives (log, seq) from the
+   * cert bytes a peer just sent, not from what we asked that peer for — so an
+   * unsolicited BLOCK naming any (log, seq) would release a reservation belonging to a
+   * DIFFERENT peer, letting the scheduler hand the same block out twice, or free a slot
+   * nobody had taken. Tying the release to the inflight-set delete makes the accounting
+   * follow what we actually requested.
+   */
   #clearRequest(l, peer, seq) {
     const p = l.peers.get(peer);
-    if (p?.inflight.delete(seq)) {
-      this.peerInflight.set(peer, Math.max(0, (this.peerInflight.get(peer) || 1) - 1));
-    }
+    const had = p ? p.inflight.delete(seq) : false;
+    if (!had) return false;
+    this.peerInflight.set(peer, Math.max(0, (this.peerInflight.get(peer) || 1) - 1));
     l.deadlines.delete(`${peer}:${seq}`);
     this.#releaseReservation(l, seq);
+    return true;
   }
 
   #onMessage(hypha, body) {

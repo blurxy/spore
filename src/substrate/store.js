@@ -116,11 +116,16 @@ export class Substrate extends EventEmitter {
   replica(logIdHex) { return this.logs.get(logIdHex) || null; }
 
   /**
-   * Get or create the replica for a log, binding it to its author.
+   * Get or create the replica for a log, binding it to its author ON CREATION ONLY.
    *
-   * Returns null if `authorPub` is not the key this log_id names. That check is the
-   * whole reason third-party replication is safe: the binding lives inside the signed
-   * header, so it cannot be restated by whoever is relaying.
+   * Read that again, because it is the whole trap. `logIdMatches` runs when the replica
+   * is new. For a log we already track it does not run, and it must not — the authority
+   * is the key we recorded the first time, not whatever the current message supplies.
+   *
+   * So the returned replica's `authorPub` is the ONLY key a caller may verify against.
+   * Verifying against the caller's own `authorPub` argument and then calling this is how
+   * a forgery gets in: the signature checks out under the forger's key, this hands back
+   * the real author's replica, and the block lands in someone else's log.
    */
   ensure(logId, authorPub) {
     const key = Buffer.from(logId).toString('hex');
@@ -147,15 +152,30 @@ export class Substrate extends EventEmitter {
   insert(cert, payload, authorPub, from = 'local') {
     if (cert.length < CERT_MIN) return { ok: false, reason: 'cert_short' };
 
-    const v = verifyBlock(cert, edKeyOf(authorPub), payload);
+    // Decode before verifying, because WHICH KEY to verify under is a property of the
+    // log, not of the message. Doing it the other way round — verify under the supplied
+    // key, then look the log up — is a forgery: the signature is real, it is simply not
+    // the author's, and the log lookup happily returns the victim's replica.
+    let d;
+    try {
+      d = decodeBlock(cert);
+    } catch (e) {
+      this.tel?.count('substrate.reject.decode');
+      return { ok: false, reason: `decode: ${e.message}` };
+    }
+
+    const r = this.ensure(d.logId, authorPub);
+    if (!r) return { ok: false, reason: 'log_author_mismatch' };
+
+    // The replica's stored key, never the wire's. For a new log the two are the same by
+    // construction (ensure just checked the binding); for a known log this is what makes
+    // the binding hold for every block after the first, which is the entire point.
+    const v = verifyBlock(cert, edKeyOf(r.authorPub), payload);
     if (!v.ok) {
       this.tel?.count(`substrate.reject.${v.reason.split(':')[0]}`);
       return { ok: false, reason: v.reason };
     }
     const b = v.block;
-
-    const r = this.ensure(b.logId, authorPub);
-    if (!r) return { ok: false, reason: 'log_author_mismatch' };
 
     const seq = Number(b.seq);
     if (!Number.isSafeInteger(seq) || seq < 0) return { ok: false, reason: 'seq_range' };
@@ -246,16 +266,28 @@ export class Substrate extends EventEmitter {
    * otherwise keep a longer frontier than everyone else and never find out why.
    */
   acceptForkProof(certA, certB, authorPub) {
-    const va = verifyBlock(certA, edKeyOf(authorPub));
-    const vb = verifyBlock(certB, edKeyOf(authorPub));
-    if (!va.ok || !vb.ok) return { ok: false, reason: 'proof_bad_signature' };
-    if (!va.block.logId.equals(vb.block.logId)) return { ok: false, reason: 'proof_different_logs' };
-    if (va.block.seq !== vb.block.seq) return { ok: false, reason: 'proof_different_seq' };
-    if (va.block.blockHash.equals(vb.block.blockHash)) return { ok: false, reason: 'proof_same_block' };
-    if (!logIdMatches(va.block.logId, authorPub)) return { ok: false, reason: 'log_author_mismatch' };
+    let da;
+    let db;
+    try {
+      da = decodeBlock(certA);
+      db = decodeBlock(certB);
+    } catch {
+      return { ok: false, reason: 'proof_undecodable' };
+    }
+    if (!da.logId.equals(db.logId)) return { ok: false, reason: 'proof_different_logs' };
+    if (da.seq !== db.seq) return { ok: false, reason: 'proof_different_seq' };
+    if (da.blockHash.equals(db.blockHash)) return { ok: false, reason: 'proof_same_block' };
 
-    const r = this.ensure(va.block.logId, authorPub);
+    // Same reorder as insert(): resolve the log first, then verify under ITS key. A proof
+    // is a claim about a specific author contradicting themselves, so verifying it under
+    // a key the messenger chose would let anyone stop anyone else's log.
+    const r = this.ensure(da.logId, authorPub);
     if (!r) return { ok: false, reason: 'log_author_mismatch' };
+
+    const va = verifyBlock(certA, edKeyOf(r.authorPub));
+    const vb = verifyBlock(certB, edKeyOf(r.authorPub));
+    if (!va.ok || !vb.ok) return { ok: false, reason: 'proof_bad_signature' };
+
     const seq = Number(va.block.seq);
     if (r.forks.has(seq)) return { ok: true, duplicate: true, seq };
     this.#recordFork(r, seq, va.block.blockHash, vb.block.blockHash, certA, certB);
