@@ -896,6 +896,38 @@ export class Substrate extends EventEmitter {
     this.authSig = sig;
     this.tel?.count('substrate.resolved');
 
+    // THE FLOOR CANNOT OUTRANK A REVOCATION BOUNDARY, which is R4e's sentence about forks
+    // with one word changed. It was written for forks and never for revocations, and the
+    // gap is only reachable under a tight budget: a member delivered and then evicted
+    // before the owner's word arrives leaves the floor ABOVE the boundary, and the reset
+    // below starts every frontier at floor - 1 — above everything the revocation was about.
+    // The rewalk then never examines a single revoked block. The replica that heard the
+    // owner first stopped at the boundary; this one believes those blocks are linked, and
+    // holds the very revocation that says otherwise (AUTHORITY is KEEP_FOREVER, so it
+    // cannot even have forgotten it). Arrival order decided delivery, which is the one
+    // outcome this substrate exists to rule out.
+    //
+    // Bringing the floor down does not un-evict anything — those blocks are gone, and that
+    // is the point. The walk restarts at the boundary, finds nothing there, and stops,
+    // which is exactly the answer the other replica reached by reading the chain.
+    for (const [k, list] of this.auth.rule) {
+      const r = this.logs.get(k.slice(0, k.indexOf('|')));
+      if (!r) continue;
+      // The entry governing a boundary is the LAST one carrying it — the list is sorted by
+      // boundary then ownerSeq. A boundary only stops the log if a revocation wins it; a
+      // re-grant sharing that boundary takes it straight back, and must not clamp anything.
+      let stop = null;
+      for (let i = 0; i < list.length; i++) {
+        if (i + 1 < list.length && list[i + 1].boundary === list[i].boundary) continue;
+        if (list[i].kind === 'revoke') { stop = list[i].boundary; break; } // sorted, so lowest
+      }
+      if (stop !== null && r.floor > stop) {
+        r.floor = stop;
+        r.floorHash = null;   // it described a block we no longer stand behind
+        r.floorLamport = 0n;
+      }
+    }
+
     const resolve = (h) => this.resolveDep(h);
     const authOf = (r, seq, d) => this.#authCheck(r, seq, d);
     const lostOf = (h) => this.lostLamport(h);

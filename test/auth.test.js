@@ -911,3 +911,51 @@ test('re-grant: a spent revocation does not reach forward past the grants that r
   assert.equal(mr.linkedTo, 15,
     'a revocation spent at seq 3 has nothing to say about a grant that begins at seq 10');
 });
+
+test('review: an eviction floor cannot outrank a revocation boundary', () => {
+  // R4e says the floor can never outrank a FORK — #recordFork brings it down with the
+  // contradiction, because a fork means nothing at or above it can be chain-verified. The
+  // same sentence is true of a revocation and was never written, so:
+  //
+  //   Order A  member's blocks link under the grant, the budget evicts them, floor climbs
+  //            past the revocation's boundary, THEN the revocation arrives. #resolveFrontiers
+  //            resets every frontier to floor - 1 — but floor is already above the boundary,
+  //            so the rewalk begins above everything the revocation was about and nothing
+  //            revoked is ever re-examined.
+  //   Order B  authority resolves first, the walk hits the boundary honestly, frontier stops.
+  //
+  // Same blocks, same revocation held by both (AUTHORITY is KEEP_FOREVER, so neither can
+  // evict it), permanently different answers. That is the one thing this substrate exists
+  // to rule out.
+  //
+  // The existing property harness cannot see this: it skips the cross-replica snapshot
+  // comparison whenever the budget is tight (test/property.test.js, `if (tight) continue`),
+  // which is the only condition under which the floor can climb past a boundary at all.
+  const build = () => {
+    const c = colony();
+    const g = c.grant(0);
+    const m = [];
+    for (let i = 0; i < 10; i++) m.push(c.mw.push({ payload: Buffer.from(`m${i}`), authRef: g.hash }));
+    const rev = c.revoke(3); // boundary 4 — seq 3 is the last seq it leaves alone
+    return { c, g, m, rev };
+  };
+
+  const width = build().m[0].cert.length + 8;
+
+  // A: the member is delivered and evicted before the owner's word ever shows up.
+  const a = build();
+  const sa = new Substrate({ maxBytes: width * 3 });
+  load(sa, [...a.m, ...a.c.blocks, a.g, a.rev]);
+
+  // B: the owner's word arrives first.
+  const b = build();
+  const sb = new Substrate({ maxBytes: width * 3 });
+  load(sb, [...b.c.blocks, b.g, b.rev, ...b.m]);
+
+  const la = sa.replica(a.c.M.logId.toString('hex')).linkedTo;
+  const lb = sb.replica(b.c.M.logId.toString('hex')).linkedTo;
+
+  assert.equal(la, lb,
+    `arrival order decided the frontier: ${la} when the revocation arrived last, ${lb} when it arrived first`);
+  assert.equal(la, 3, 'and the honest answer is the revocation boundary minus one');
+});
