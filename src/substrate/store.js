@@ -59,6 +59,7 @@ export class LogReplica {
     this.bits = new Bitfield(1); // held-set, grows with the log
     this.head = -1; // highest seq we hold
     this.linkedTo = -1; // highest seq reachable by prev_hash from 0
+    this.pendingDeps = false; // frontier is waiting on a dep in another log
     this.forks = new Map(); // seq -> { kept, other } block hashes
     this.forkedAt = Infinity; // lowest seq the author signed twice; the log ends here
   }
@@ -76,24 +77,54 @@ export class LogReplica {
   }
 
   /**
-   * Advance the linked frontier as far as prev_hash allows.
+   * Advance the linked frontier as far as prev_hash AND lamport allow.
    *
    * Called after every insert, because the block that just landed may be the one that
    * closes a gap and promotes a long run at once. Genesis (seq 0) is linked when its
    * prev_hash is all zero; every later block when its prev_hash equals the block before.
-   *
    * It never advances to or past a fork. See `recordFork`.
+   *
+   * LAMPORT IS CHECKED HERE AND NOWHERE ELSE, for the same reason prev_hash is: the rule
+   * is `lamport = 1 + max(own previous, all deps)`, and you cannot evaluate it without
+   * holding the previous block. Linking is precisely the point at which we do.
+   *
+   * Two rules, and the difference between them matters:
+   *
+   *   STALL  a dep we do not yet hold, or hold but have not LINKED, stops promotion here
+   *          until it links. Reading a dep's lamport before that dep is validated would
+   *          mean trusting the exact number we are trying not to trust.
+   *   STOP   a lamport that does not equal the derived value halts the frontier at s-1,
+   *          permanently and identically on every replica — the same deterministic stop
+   *          a fork gets. Rejecting the block instead would make the outcome depend on
+   *          arrival order, which is the bug class this substrate already shipped once.
+   *
+   * `resolve(depHash)` returns { lamport, linked } for a block in ANY log, or null.
+   * A LogReplica cannot see other replicas, so the Substrate supplies it.
    */
-  relink() {
+  relink(resolve) {
     const promoted = [];
     for (let s = this.linkedTo + 1; s < this.forkedAt; s++) {
       const b = this.blocks.get(s);
       if (!b) break;
       const d = decodeBlock(b.cert);
-      const ok = s === 0
+
+      const chained = s === 0
         ? d.prevHash.every((x) => x === 0)
         : d.prevHash.equals(this.hashAt(s - 1) || Buffer.alloc(0));
-      if (!ok) break; // a real break in the author's own chain; stop, do not skip it
+      if (!chained) break; // a real break in the author's own chain; stop, do not skip it
+
+      let m = s === 0 ? 0n : this.blocks.get(s - 1).lamport;
+      let stalled = false;
+      for (const dep of d.deps) {
+        const r = resolve(dep);
+        if (!r || !r.linked) { stalled = true; break; }
+        if (r.lamport > m) m = r.lamport;
+      }
+      if (stalled) { this.pendingDeps = true; break; }
+      this.pendingDeps = false;
+
+      if (d.lamport !== m + 1n) break; // asserted, not derived. The log ends here.
+
       this.linkedTo = s;
       promoted.push(s);
     }
@@ -115,6 +146,50 @@ export class Substrate extends EventEmitter {
     super();
     this.tel = telemetry;
     this.logs = new Map(); // logIdHex -> LogReplica
+    // block_hash -> { key, seq }. Deps name blocks by hash and may point into ANY log,
+    // so validating a dep's lamport needs a substrate-wide index; a replica only sees
+    // itself.
+    this.byHash = new Map();
+  }
+
+  /** What a dep points at, for lamport derivation. null if we do not hold it. */
+  resolveDep(depHash) {
+    const at = this.byHash.get(Buffer.from(depHash).toString('hex'));
+    if (!at) return null;
+    const r = this.logs.get(at.key);
+    const b = r?.get(at.seq);
+    if (!b) return null;
+    return { lamport: b.lamport, linked: at.seq <= r.linkedTo };
+  }
+
+  /**
+   * Relink every replica until nothing more moves.
+   *
+   * A block stalled on a cross-log dep becomes linkable the moment that dep links, and
+   * the dep lives in a different replica — so linking one log can unblock another, and a
+   * single pass over the log that just changed is not enough. The loop is bounded by
+   * progress: each round must promote at least one block or it is the last.
+   */
+  #relinkAll(seed) {
+    const resolve = (h) => this.resolveDep(h);
+    const out = new Map();
+    let round = [seed];
+    for (;;) {
+      let moved = false;
+      for (const r of round) {
+        const got = r.relink(resolve);
+        if (!got.length) continue;
+        moved = true;
+        const prev = out.get(r) || [];
+        out.set(r, prev.concat(got));
+      }
+      if (!moved) break;
+      // Only replicas actually waiting on a dep can have been unblocked by that progress.
+      round = [...this.logs.values()].filter((r) => r.pendingDeps);
+      if (!round.length) break;
+    }
+    for (const [r, seqs] of out) this.emit('linked', { logId: r.logId, seqs });
+    return out.get(seed) || [];
   }
 
   get size() {
@@ -214,13 +289,12 @@ export class Substrate extends EventEmitter {
     r.reserve(seq);
     r.bits.set(seq);
     if (seq > r.head) r.head = seq;
+    this.byHash.set(b.blockHash.toString('hex'), { key: r.key, seq });
 
     this.tel?.count('substrate.blocks', 1);
     this.emit('block', { logId: r.logId, seq, from, block: b, payload });
 
-    const promoted = r.relink();
-    if (promoted.length) this.emit('linked', { logId: r.logId, seqs: promoted });
-
+    const promoted = this.#relinkAll(r);
     return { ok: true, seq, linked: promoted };
   }
 
@@ -263,6 +337,9 @@ export class Substrate extends EventEmitter {
     }
     this.tel?.count('substrate.equivocation');
     const f = r.forks.get(seq);
+    // a retraction can un-link blocks other logs' deps were relying on; their frontiers
+    // are recomputed from scratch next time anything moves, which relink() already does
+    // because it only ever walks forward from linkedTo.
     this.emit('equivocation', { logId: r.logId, seq, a: keptHash, b: otherHash, certA: f.certA, certB: f.certB });
     if (retracted.length) {
       this.tel?.count('substrate.retracted', retracted.length);

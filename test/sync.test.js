@@ -169,6 +169,96 @@ test('store: the linked frontier stops at a gap and resumes when it is filled', 
   assert.deepEqual(linked, [0, 1, 2, 3, 4]);
 });
 
+test('store: a block that asserts its lamport instead of deriving it stops the log', () => {
+  // The inflation attack the spec says is closed. It was not: nothing anywhere compared
+  // the lamport field to 1 + max(own previous, deps), so a peer could declare 2^60 and
+  // pin every receiving spore's clock there forever.
+  const id = identity();
+  const s = new Substrate();
+  let prevHash = Buffer.alloc(32);
+  const mk = (seq, lamport) => {
+    const payload = Buffer.from(`b${seq}`);
+    const r = encodeBlock(
+      { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq, lamport, prevHash, payload },
+      id.kp.privateKey,
+    );
+    prevHash = r.blockHash;
+    return { cert: r.cert, payload };
+  };
+
+  const b0 = mk(0, 1n);
+  const b1 = mk(1, 1n << 60n);   // the lie
+  const b2 = mk(2, (1n << 60n) + 1n); // self-consistent with the lie
+
+  for (const b of [b0, b1, b2]) assert.ok(s.insert(b.cert, b.payload, id.pub).ok, 'all are signed correctly');
+
+  const rep = s.replica(id.logId.toString('hex'));
+  assert.equal(rep.held, 3, 'they are authentic, so they are held');
+  assert.equal(rep.linkedTo, 0, 'but the chain stops at the first asserted lamport');
+});
+
+test('store: lamport is derived across logs, and a dep must LINK before it counts', () => {
+  // The first dep-carrying blocks in this project. Until now depCount was always 0, so
+  // this path had never run: a block whose lamport depends on another LOG's block.
+  const alice = identity();
+  const bob = identity();
+
+  const aPayload = Buffer.from('alice 0');
+  const a0 = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: alice.logId, seq: 0, lamport: 1n, payload: aPayload },
+    alice.kp.privateKey,
+  );
+  const aPayload1 = Buffer.from('alice 1');
+  const a1 = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: alice.logId, seq: 1, lamport: 2n,
+      prevHash: a0.blockHash, payload: aPayload1 },
+    alice.kp.privateKey,
+  );
+
+  // Bob's genesis cites Alice's second block: lamport = 1 + max(0, 2) = 3.
+  const bPayload = Buffer.from('bob 0');
+  const b0 = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: bob.logId, seq: 0, lamport: 3n,
+      payload: bPayload, deps: [a1.blockHash] },
+    bob.kp.privateKey,
+  );
+
+  const s = new Substrate();
+  assert.ok(s.insert(b0.cert, bPayload, bob.pub).ok, 'held immediately — the signature is self-contained');
+  const rb = s.replica(bob.logId.toString('hex'));
+  assert.equal(rb.linkedTo, -1, 'but it cannot link: the dep is not here yet');
+
+  s.insert(a1.cert, aPayload1, alice.pub);
+  assert.equal(rb.linkedTo, -1, 'still not: alice seq 1 is held but not LINKED, so its lamport is unverified');
+
+  s.insert(a0.cert, aPayload, alice.pub);
+  assert.equal(s.replica(alice.logId.toString('hex')).linkedTo, 1, 'alice links end to end');
+  assert.equal(rb.linkedTo, 0, 'and linking HER log unblocks HIS — one pass would have missed this');
+});
+
+test('store: a cross-log lamport that does not match the dep is refused', () => {
+  const alice = identity();
+  const bob = identity();
+  const aP = Buffer.from('alice 0');
+  const a0 = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: alice.logId, seq: 0, lamport: 1n, payload: aP },
+    alice.kp.privateKey,
+  );
+  // cites a block with lamport 1, so the only legal value is 2. Claims 9.
+  const bP = Buffer.from('bob 0');
+  const b0 = encodeBlock(
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: bob.logId, seq: 0, lamport: 9n,
+      payload: bP, deps: [a0.blockHash] },
+    bob.kp.privateKey,
+  );
+
+  const s = new Substrate();
+  s.insert(a0.cert, aP, alice.pub);
+  s.insert(b0.cert, bP, bob.pub);
+  assert.equal(s.replica(alice.logId.toString('hex')).linkedTo, 0);
+  assert.equal(s.replica(bob.logId.toString('hex')).linkedTo, -1, 'the inflated cross-log claim never links');
+});
+
 test('store: a log cannot be claimed by a key it does not name', () => {
   const alice = identity();
   const mallory = identity();

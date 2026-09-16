@@ -48,8 +48,13 @@ const staticKeys = generateStatic();
 // Once blocks travel through third parties, a log has to carry proof of who may write it,
 // and this binding is that proof — it lives inside the signed header of every block.
 const logId = logIdFor(sporeId);
-let seq = 0n;
-let lamport = 0n;
+// -1 so the first append is seq 0. A log's genesis is seq 0 by definition — relink()
+// looks for it there and stops dead if it is missing, which meant a spore's own log never
+// linked at all and its messages never reached the ordered-delivery path. Unit tests could
+// not see this: they build chains from 0 directly and never go through say().
+let seq = -1n;
+let ownPrev = 0n;   // lamport of OUR last block — the only input we may assert from
+let lamport = 0n;   // local causal clock, for display; never stamped into a block
 let prevHash = Buffer.alloc(32);
 
 const beacon = new Beacon({
@@ -73,12 +78,39 @@ const view = new MyceliumView(tel, { nick: NICK, sporeId: sporeId.toString('hex'
 // nothing to schedule. The Syncer PULLS: history is fetched rarest-first from whoever has
 // it, because throughput is what matters and there is a lot to schedule. Conflating them
 // would make live chat wait behind a backlog, which is the wrong trade in both directions.
+/**
+ * The most recent thing we have seen from somebody else, as a citable dep.
+ *
+ * Only LINKED blocks qualify. A held-but-unlinked block's lamport has not been validated
+ * yet, and citing it would stall our own block at every receiver until it links there too.
+ */
+function latestForeignDep() {
+  let best = null;
+  for (const r of substrate.logs.values()) {
+    if (r.logId.equals(logId) || r.linkedTo < 0) continue;
+    const b = r.get(r.linkedTo);
+    if (b && (!best || b.lamport > best.lamport)) best = { hash: b.hash, lamport: b.lamport };
+  }
+  return best;
+}
+
 function say(text) {
   const payload = Buffer.from(text, 'utf8');
   seq += 1n;
-  lamport = deriveLamport(lamport, []);
+
+  // Lamport must be DERIVABLE BY THE RECEIVER, not merely correct here. The rule is
+  // 1 + max(own previous, all deps), so anything that raised our clock has to be cited —
+  // otherwise a peer recomputing the value gets a different number, and under the new
+  // link-time check their frontier stops at our block. Absorbing other spores' lamports
+  // into a local counter and stamping THAT was the old behaviour, and it was unverifiable
+  // by construction: it asserted a number nobody else could reproduce.
+  const dep = latestForeignDep();
+  const cite = dep && dep.lamport >= ownPrev ? dep : null;
+  const deps = cite ? [cite.hash] : [];
+  const lam = deriveLamport(ownPrev, cite ? [cite.lamport] : []);
+
   const { cert, blockHash } = encodeBlock(
-    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId, seq, lamport, prevHash, payload },
+    { type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId, seq, lamport: lam, prevHash, payload, deps },
     idKeys.privateKey,
   );
   if (!blockFits(cert.length, payload.length)) {
@@ -96,10 +128,12 @@ function say(text) {
     return 0;
   }
 
+  ownPrev = lam;
+  if (lam > lamport) lamport = lam;
   const n = sync.push(cert, payload);
   sync.announce(logId, Number(seq));
   tel.count('hypha.bytes', (cert.length + payload.length) * Math.max(1, n));
-  tel.event('substrate.appended', { seq: Number(seq), lamport: Number(lamport), toPeers: n, text });
+  tel.event('substrate.appended', { seq: Number(seq), lamport: Number(lam), deps: deps.length, toPeers: n, text });
   view.lamport = Number(lamport);
   view.message(NICK, text);
   return n;
@@ -115,8 +149,6 @@ mgr.on('message', ({ payload }) => tel.count('hypha.bytes', payload.length));
 // are still in flight.
 substrate.on('block', ({ logId: lid, seq: s, block, from }) => {
   if (lid.equals(logId)) return; // our own
-  lamport = deriveLamport(lamport, [block.lamport]);
-  view.lamport = Number(lamport);
   tel.event('substrate.verified', { from, log: lid.toString('hex').slice(0, 6), seq: s, lamport: Number(block.lamport) });
 });
 
@@ -126,8 +158,17 @@ substrate.on('block', ({ logId: lid, seq: s, block, from }) => {
 // close. The design note says scheduling reads `held` and ordered delivery reads `linked`;
 // this is the line where the interface actually obeys it.
 substrate.on('linked', ({ logId: lid, seqs }) => {
-  if (lid.equals(logId)) return; // our own, already shown by say()
   const rep = substrate.replica(lid.toString('hex'));
+  // The causal clock advances on VALIDATED blocks only. It used to advance on every held
+  // block, using a lamport nothing had checked — so one peer asserting 2^60 dragged every
+  // spore that merely RECEIVED it to 2^60, forever. That is the inflation attack the spec
+  // claimed was closed.
+  for (const s of seqs) {
+    const b = rep?.get(s);
+    if (b && b.lamport > lamport) lamport = b.lamport;
+  }
+  view.lamport = Number(lamport);
+  if (lid.equals(logId)) return; // our own, already shown by say()
   const who = lid.toString('hex').slice(0, 6);
   for (const s of seqs) {
     const b = rep?.get(s);
