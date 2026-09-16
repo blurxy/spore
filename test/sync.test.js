@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
-import { HyphaManager } from '../src/transport/tcp.js';
+import { HyphaManager, MAX_WRITE_BUFFER } from '../src/transport/tcp.js';
 import { generateStatic } from '../src/session/noise.js';
 import { encodeBlock, logIdFor, newLogId, TYPE, FLAG } from '../src/substrate/block.js';
 import { Substrate } from '../src/substrate/store.js';
@@ -542,6 +542,82 @@ test('sync: a log flood is capped rather than tracked forever', async () => {
 
   victim.sync.stop();
   await victim.mgr.stop(); await hostile.mgr.stop();
+});
+
+test('hypha: a peer that stops reading gets cut off instead of buffered forever', async () => {
+  // Node's own docs: "Writing a socket that is not draining may lead to a remotely
+  // exploitable vulnerability, since TCP sockets may never drain if the remote peer does
+  // not read the data." The attacker does not need to flood us — one request for a large
+  // range, then simply never read the answer. Capping what we serve per request does not
+  // help, because they control how fast we drain, not how much we send.
+  const a = spore(47680);
+  const b = spore(47681);
+  await a.mgr.listen();
+  await b.mgr.listen();
+
+  const established = new Promise((res) => a.mgr.once('hypha', res));
+  const out = await b.mgr.dial({ sporeId: a.id.pub, addrs: ['127.0.0.1'], tcpPort: 47680 });
+  const inbound = await established;
+
+  // The receiver goes silent at the socket level: still connected, no longer reading.
+  inbound.socket.pause();
+
+  const blob = Buffer.alloc(60000, 0x5a);
+  let reason = null;
+  out.once('close', ({ reason: r }) => { reason = r; });
+
+  let sent = 0;
+  let threw = false;
+  for (let i = 0; i < 2000 && !threw; i++) {
+    try { out.send(blob); sent++; } catch { threw = true; }
+  }
+
+  assert.ok(threw, `sender queued ${sent} frames without ever refusing`);
+  assert.equal(reason, 'peer_not_draining');
+  assert.ok(out.socket.writableLength < MAX_WRITE_BUFFER * 4,
+    `buffer reached ${out.socket.writableLength} bytes`);
+
+  await a.mgr.stop(); await b.mgr.stop();
+});
+
+test('hypha: a dial that fails leaves no socket behind', async () => {
+  const a = spore(47682);
+  await a.mgr.listen();
+
+  // 47683 is inside the allowlist and has nothing listening. Every beacon-discovered peer
+  // that is firewalled, asleep, or gone takes this path, and on a phone mesh that is the
+  // common case rather than the edge — one leaked handle each, permanently.
+  for (let i = 0; i < 5; i++) {
+    const h = await a.mgr.dial({ sporeId: identity().pub, addrs: ['127.0.0.1'], tcpPort: 47683 });
+    assert.equal(h, null, 'the dial must fail');
+  }
+  await settle(50);
+  assert.equal(a.mgr.sockets.size, 0, `leaked ${a.mgr.sockets.size} sockets`);
+
+  await a.mgr.stop();
+});
+
+test('sync: a forked log does not report itself complete', async () => {
+  // #totalFor clamps total to forkedAt, but `held` counted every block ever accepted —
+  // including ones above the fork that can never link. So a forked log could announce
+  // completion while holding nothing readable past the contradiction.
+  const author = identity();
+  const { main, other } = forkedChain(author, 12, 5);
+
+  const s = spore(47684, { seedFrom: { id: author, blocks: main } });
+  await s.mgr.listen();
+  s.sync.start();
+
+  const key = author.logId.toString('hex');
+  s.store.insert(other.cert, other.payload, author.pub);
+  const rep = s.store.replica(key);
+  assert.equal(rep.forkedAt, 5);
+  // The losing branch is kept as proof, not as a block, so held is the 12 main blocks.
+  assert.equal(rep.held, 12, 'it still HOLDS everything, including the unusable tail');
+  assert.equal(rep.countBelow(5), 5, 'but only five blocks are below the fork');
+
+  s.sync.stop();
+  await s.mgr.stop();
 });
 
 test('sync: a joiner pulls a whole backlog over real hyphae and links every block', async () => {

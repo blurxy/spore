@@ -58,6 +58,19 @@ export const MAX_LOGS = 256;
 export const REQUEST_TIMEOUT_NS = 8_000_000_000n; // 8s of local patience
 const PUMP_MS = 25;
 
+/**
+ * How often a spore re-announces everything it holds.
+ *
+ * A full HAVE used to be sent once, at hypha setup, and never again. That made every
+ * correction one-way: when a request timed out we cleared the peer's bit for that block
+ * (a timeout is an unspoken NOBLOCK), and if that peer was the ONLY source, nothing ever
+ * re-advertised it. The sync stalled with no error reported anywhere.
+ *
+ * BitTorrent re-advertises for the same reason. Ten seconds is cheap — one frame per
+ * hypha carrying a bitfield — and it repairs drift generally, not just the timeout case.
+ */
+const HAVE_REFRESH_MS = 10_000;
+
 const peerHexOf = (h) => Buffer.from(h.peerId).toString('hex');
 
 /** Rebuild a peer's advertised bitfield from the wire form. */
@@ -106,6 +119,7 @@ export class Syncer extends EventEmitter {
     this.logs = new Map(); // logIdHex -> LogSync
     this.peerInflight = new Map(); // peerHex -> total outstanding across all logs
     this.timer = null;
+    this.refresh = null;
     // When true, no requests are issued. Serving continues normally — a paused spore is
     // still a good citizen. The harness needs this because pump() is called directly from
     // #recvHave and #recvHaveAdd, not only from the interval, so a joiner starts pulling
@@ -160,12 +174,24 @@ export class Syncer extends EventEmitter {
     if (this.timer) return this;
     this.timer = setInterval(() => this.pump(), PUMP_MS);
     this.timer.unref?.(); // never hold the process open just to poll for work
+    this.refresh = setInterval(() => this.refreshAll(), HAVE_REFRESH_MS);
+    this.refresh.unref?.();
     return this;
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
+    if (this.refresh) clearInterval(this.refresh);
     this.timer = null;
+    this.refresh = null;
+  }
+
+  /** Re-announce everything, to everyone. Repairs bits we cleared on a timeout. */
+  refreshAll() {
+    for (const h of this.mgr.hyphae.values()) {
+      this.sendHave(h);
+      this.sendForks(h);
+    }
   }
 
   /** Get or start tracking a log. Returns null once the cap is reached. */
@@ -470,10 +496,15 @@ export class Syncer extends EventEmitter {
     const l = this.logs.get(logKey);
     if (!r || !l) return;
     const total = this.#totalFor(l, r);
-    this.emit('progress', { logId: r.logId, held: r.held, total });
-    if (total > 0 && r.held >= total) {
-      this.emit('complete', { logId: r.logId, blocks: r.held });
-      this.tel?.event('sync.complete', { log: logKey.slice(0, 12), blocks: r.held });
+    // Count only what is below the fork. #totalFor already clamps `total` to forkedAt, but
+    // `held` counted every block ever accepted — including ones above the fork, which can
+    // never link and will never be readable. So a forked log could report itself complete
+    // while holding nothing usable past the contradiction.
+    const held = r.forked ? r.countBelow(total) : r.held;
+    this.emit('progress', { logId: r.logId, held, total });
+    if (total > 0 && held >= total) {
+      this.emit('complete', { logId: r.logId, blocks: held });
+      this.tel?.event('sync.complete', { log: logKey.slice(0, 12), blocks: held });
     }
   }
 

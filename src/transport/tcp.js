@@ -13,6 +13,25 @@ import { HYPHA_PORT } from './beacon.js';
 export const MAX_FRAME = 65536;
 
 /**
+ * How much unsent data we tolerate in one socket before killing the hypha.
+ *
+ * From Node's own stream documentation: "Writing a socket that is not draining may lead
+ * to a remotely exploitable vulnerability, since TCP sockets may never drain if the
+ * remote peer does not read the data." That is the whole attack. A peer does not need to
+ * flood us with requests — it sends ONE request for a large range and then simply stops
+ * reading the answer. Our writes never complete, the buffer grows without limit, and on a
+ * phone the OS kills the process.
+ *
+ * Capping how much we SERVE per request does not close it, because the attacker controls
+ * how fast we drain, not how much we send. The bound has to be on the buffer itself.
+ *
+ * Closing rather than pausing is deliberate, and it is the same posture as "any AEAD
+ * failure is fatal": a peer that is not draining is dead or hostile, and a queue we hold
+ * on its behalf is a resource it controls for free. No retries, no drain-waiting.
+ */
+export const MAX_WRITE_BUFFER = 4 * 1024 * 1024;
+
+/**
  * Hard address allowlist. Any destination outside it is refused and counted.
  * This turns "no internet dependency of any kind" into a testable invariant rather
  * than a design intention.
@@ -139,6 +158,12 @@ export class Hypha extends EventEmitter {
 
   send(payload) {
     if (this.closed) throw new Error('hypha closed');
+    // Check before encrypting: a hypha that is already over budget must not consume a
+    // nonce for a frame it is not going to get to send.
+    if (this.socket.writableLength > MAX_WRITE_BUFFER) {
+      this.close('peer_not_draining');
+      throw new Error('peer not draining');
+    }
     const ad = this.#ad();
     const ct = this.cipher.encrypt(ad, payload);
     const out = frame(Buffer.concat([ad, ct]));
@@ -305,6 +330,7 @@ export class HyphaManager extends EventEmitter {
 
   async dial(peer) {
     const key = peer.sporeId.toString('hex');
+    if (this.stopping) return null;
     if (this.hyphae.has(key) || this.dialing.has(key)) return null;
 
     const host = peer.addrs?.[0] || peer.from;
@@ -317,15 +343,28 @@ export class HyphaManager extends EventEmitter {
 
     this.dialing.add(key);
     this.tel?.event('hypha.dialing', { host, port: peer.tcpPort, range: gate.range });
+    // Tracked BEFORE connecting, not after. stop() destroys what it can see, and a socket
+    // still inside the connect await was invisible to it — so a dial in flight during
+    // shutdown could complete afterwards and resurrect a hypha on a manager that had
+    // already stopped.
+    const socket = net.connect({ host, port: peer.tcpPort || this.port });
+    this.#track(socket);
     try {
-      const socket = await new Promise((res, rej) => {
-        const s = net.connect({ host, port: peer.tcpPort || this.port }, () => res(s));
-        s.once('error', rej);
-        s.setTimeout(6000, () => rej(new Error('connect_timeout')));
+      await new Promise((res, rej) => {
+        socket.once('connect', res);
+        socket.once('error', rej);
+        // Socket#setTimeout does NOT close the connection — it only fires the event. The
+        // old code rejected and walked away, leaving the handle open forever. Every
+        // firewalled or sleeping peer the beacon found cost one socket, permanently, and
+        // on a phone mesh those are the common case rather than the edge.
+        socket.setTimeout(6000, () => {
+          socket.destroy();
+          rej(new Error('connect_timeout'));
+        });
       });
+      if (this.stopping) { socket.destroy(); return null; }
       socket.setNoDelay(true);
       socket.setTimeout(0);
-      this.#track(socket);
 
       const hs = new Handshake({
         initiator: true,
@@ -336,6 +375,7 @@ export class HyphaManager extends EventEmitter {
       const { cipher, carryover } = await runHandshake(socket, hs, this.tel);
       return this.#adopt(new Hypha(socket, cipher, hs.peerId, { initiator: true, host }, carryover));
     } catch (e) {
+      try { socket.destroy(); } catch { /* already gone */ }
       this.tel?.event('hypha.dial_failed', { host, reason: e.code || e.message });
       return null;
     } finally {

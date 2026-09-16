@@ -71,6 +71,13 @@ export class LogReplica {
   get(seq) { return this.blocks.get(seq) || null; }
   hashAt(seq) { return this.blocks.get(seq)?.hash || null; }
 
+  /** How many blocks we hold strictly below `limit`. Used to measure a forked log. */
+  countBelow(limit) {
+    let n = 0;
+    for (const seq of this.blocks.keys()) if (seq < limit) n++;
+    return n;
+  }
+
   /** Grow the held-bitfield so index `seq` is representable. */
   reserve(seq) {
     if (seq + 1 > this.bits.size) this.bits.grow(seq + 1);
