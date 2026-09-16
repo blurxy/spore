@@ -682,6 +682,36 @@ engineers (§1.9).**
 | Live message delivery latency | Direct hypha frame delivery | **No, by design, and we say so** | N/A | N/A | Flat at hop-count × hypha-RTT regardless of N; this is a stated non-scaling guarantee, not a gap |
 | Durability | Replication factor R = min(N, 2 or 3) | N/A below N=4 | N ≤ 3: **no sharding occurs at all**, R ≥ N | N=1: device durability only; N=2: 1→2 catch-up copy | Durability requires N ≥ 4 before sharding provides any margin beyond full replication |
 
+### 3.1 Three ceilings, measured separately
+
+The first version of this table had one ceiling in it: the shared medium. Running the
+falsifier with the medium removed showed that was not the whole story, and that the control
+meant to isolate the medium was quietly measuring something else.
+
+| Configuration | N=5 | N=20 | What binds |
+|---|---|---|---|
+| Real Wi-Fi cell (shared medium, pipeline 6) | **3.59×** | **3.59×** | The air. Flat past N≈5. |
+| No medium, pipeline still 6 deep | 3.68× | **4.75×** | Request concurrency. |
+| No medium, no pipeline cap | 5.38× | **32.30×** | Nothing — supply scales roughly linearly. |
+
+The middle row is a ceiling this project did not know it had. One joiner holding six
+outstanding requests can be fed by at most six seeders at any instant, so with 20 sources
+present, fourteen of them are never asked for anything. That is not the shared medium; it
+has a different cause and a completely different fix (`MAX_INFLIGHT_PER_PEER` in
+`src/sharding/sync.js`, not more radios).
+
+An earlier control conflated the two: it lifted the cell cap and the radio ceiling but left
+the pipeline at 6, measured 4.25× → 4.75×, and reported it as evidence about the medium. It
+was evidence about the pipeline. Corrected, the same control reaches 32.30× — supply really
+does scale, and the medium really is what bends the real curve.
+
+**The conclusion that matters for phones: inside one Wi-Fi cell the medium binds first
+(3.59× before 4.75×), so raising the pipeline depth buys nothing there.** It becomes the
+binding constraint only once the medium stops being one — that is, across independent radio
+domains, which is the same variable §3's header line already names. The bottom row is what
+SPORE would reach if bandwidth were free, and it is the number that says the scheduler
+itself is not the limit.
+
 ## 4. Corrected interface contract between the six subsystems
 
 This supersedes each design doc's individually-proposed interface where they conflict. Owner

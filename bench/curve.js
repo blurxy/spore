@@ -72,7 +72,7 @@ class Bucket {
  */
 function runSwarm({
   seeders = 1, joiners, cellCap = true, churnEverySec = 0, serial = false, seed = 1,
-  downlink = DOWNLINK, minAlive = 1,
+  downlink = DOWNLINK, minAlive = 1, maxInflight = MAX_INFLIGHT,
 }) {
   let rnd = seed >>> 0;
   const rand = () => ((rnd = (rnd * 1664525 + 1013904223) >>> 0) / 2 ** 32);
@@ -133,20 +133,20 @@ function runSwarm({
 
     // --- schedule, but only for joiners that actually have a free request slot
     for (const me of working) {
-      if (me.downloading.size >= MAX_INFLIGHT) continue;
+      if (me.downloading.size >= maxInflight) continue;
       const peers = new Map();
       for (const p of alive) {
         if (p === me) continue;
         if (serial && !p.seeder) continue;   // Control A: only the seeder ever serves
-        if (p.uploading.size >= MAX_INFLIGHT) continue;
-        peers.set(p.id, { have: p.have, inflight: p.uploading, maxInflight: MAX_INFLIGHT, ref: p });
+        if (p.uploading.size >= maxInflight) continue;
+        peers.set(p.id, { have: p.have, inflight: p.uploading, maxInflight, ref: p });
       }
       if (!peers.size) continue;
-      for (const a of sched.plan(me.have, peers, inflight, replicas, MAX_INFLIGHT - me.downloading.size)) {
+      for (const a of sched.plan(me.have, peers, inflight, replicas, maxInflight - me.downloading.size)) {
         const from = peers.get(a.peerId).ref;
         transfers.push({ from, to: me, index: a.index, moved: 0, startedAt: t });
         me.downloading.add(a.index);
-        if (me.downloading.size >= MAX_INFLIGHT) break;
+        if (me.downloading.size >= maxInflight) break;
       }
     }
 
@@ -290,22 +290,49 @@ console.log();
 plotCurve(rows).forEach((l) => console.log(l));
 console.log(`${C.dim}   newcomer sync speedup vs control A, by number of sources present${C.off}`);
 
-// Control B: identical swarm with the medium removed — no shared cell, radio RX lifted.
-// If supply itself scales, this must keep climbing exactly where the capped run flattens.
+// Control B: the medium removed — no shared cell, radio RX lifted. If supply itself
+// scales, this must keep climbing exactly where the capped run flattens.
+//
+// It also lifts the request pipeline, and that is not a thumb on the scale — it is a
+// correction. An earlier version of this control left MAX_INFLIGHT at 6 and reported
+// only 4.25x -> 4.75x, failing its own 1.2x threshold. The reason was not that supply
+// stops scaling. It is that ONE joiner with six outstanding requests can be fed by at
+// most six seeders at a time, so the 7th through 20th seeder were never asked for
+// anything. The control was measuring the pipeline depth and calling it the medium.
+//
+// So: a control meant to isolate the medium has to remove every OTHER ceiling, and
+// pipeline depth is one of them. That ceiling is real and is now reported in its own
+// right below — it just is not the shared air, and conflating the two would have
+// credited the medium with a limit that has a completely different fix.
 console.log();
 rule();
 const capped20 = rows.at(-1).speedup;
 const n5 = rows.find((r) => r.n === 5).speedup;
-const bFree = (n) => ctrlA.cohortMs
-  / runSwarm({ seeders: n, joiners: 1, cellCap: false, downlink: DOWNLINK * 10, seed: 7 }).firstMs;
+const bFree = (n) => ctrlA.cohortMs / runSwarm({
+  seeders: n, joiners: 1, cellCap: false, downlink: DOWNLINK * 10, seed: 7,
+  maxInflight: 64,
+}).firstMs;
 const uncapped5 = bFree(5);
 const uncapped20 = bFree(20);
+
+// Control C: the medium removed but the pipeline left at its real depth. The gap between
+// this and control B is exactly what request concurrency costs, with no radio involved.
+const bPipe = (n) => ctrlA.cohortMs / runSwarm({
+  seeders: n, joiners: 1, cellCap: false, downlink: DOWNLINK * 10, seed: 7,
+}).firstMs;
+const pipe5 = bPipe(5);
+const pipe20 = bPipe(20);
 
 const flat = Math.abs(capped20 - n5) / n5 <= 0.2;
 const bKeepsGaining = uncapped20 > uncapped5 * 1.2;
 
 pulse(`capped    · N=5 ${fmt(n5, 2)}x → N=20 ${fmt(capped20, 2)}x   ${flat ? '[FLAT — the medium binds]' : '[STILL CLIMBING]'}`);
 pulse(`control B · N=5 ${fmt(uncapped5, 2)}x → N=20 ${fmt(uncapped20, 2)}x   ${bKeepsGaining ? '[keeps gaining — supply really does scale]' : '[also flat]'}`);
+pulse(`            no medium, no pipeline cap — supply is the only variable left`);
+pulse(`control C · N=5 ${fmt(pipe5, 2)}x → N=20 ${fmt(pipe20, 2)}x   [no medium, pipeline still 6 deep]`);
+pulse(`            SECOND CEILING: one joiner with ${MAX_INFLIGHT} outstanding requests can be fed`);
+pulse(`            by at most ${MAX_INFLIGHT} seeders at once, so beyond N=${MAX_INFLIGHT} extra sources sit idle.`);
+pulse(`            Nothing to do with the air. Fixed by pipeline depth, not by more radios.`);
 rule();
 
 // Flash crowd: K joiners at once. This is where a swarm beats a server outright, because
@@ -343,6 +370,8 @@ console.log(`${C.mag}  VERDICT${C.off}`);
 console.log(`  ${flat ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`} falsifier 1 — capped curve flat N=5→20 (${fmt(n5, 2)}x → ${fmt(capped20, 2)}x)`);
 console.log(`  ${bKeepsGaining ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`} falsifier 2 — uncapped control keeps gaining (${fmt(uncapped5, 2)}x → ${fmt(uncapped20, 2)}x)`);
 console.log(`  ${churnRatio <= 2 ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`} churn — cohort within 2x of clean (${fmt(churnRatio, 2)}x)`);
+console.log(`${C.dim}  and a ceiling this run separated out: with the medium gone, pipeline depth alone`);
+console.log(`  holds N=20 to ${fmt(pipe20, 2)}x where unlimited concurrency reaches ${fmt(uncapped20, 2)}x.${C.off}`);
 console.log();
 console.log(`${C.dim}  ARCHITECTURE.md §3 predicts 3.3x saturating near N=5. Measured peak: ${fmt(Math.max(...rows.map((r) => r.speedup)), 2)}x${C.off}`);
 console.log(`${C.dim}  RESOLVED: an earlier run of this benchmark was scaled 10x down because blake2b256`);
