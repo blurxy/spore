@@ -17,7 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import {
-  encodeBlock, logIdFor, TYPE, FLAG,
+  encodeBlock, decodeBlock, logIdFor, TYPE, FLAG,
   encodeGrant, decodeGrant, encodeRevoke, decodeRevoke, colonyIdFor,
 } from '../src/substrate/block.js';
 import { Substrate } from '../src/substrate/store.js';
@@ -110,6 +110,19 @@ function v1World({ pinBehind = 0, ownerTraffic = 8 } = {}) {
 }
 
 const load = (s, blocks) => blocks.map((b) => s.insert(b.cert, b.payload, b.authorPub));
+
+/** A second, different block signed at the same seq — the other half of a fork proof. */
+function forkBlockAt(id, scopeId, seq, twin, text) {
+  const d = decodeBlock(twin.cert);
+  const { cert, blockHash } = encodeBlock(
+    {
+      type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq,
+      lamport: d.lamport, scopeId, prevHash: d.prevHash, payload: Buffer.from(text),
+    },
+    id.kp.privateKey,
+  );
+  return { cert, payload: Buffer.from(text), authorPub: id.pub, hash: blockHash, seq };
+}
 
 test('V1: a revoked moderator cannot replay a stale auth_ref, even with a lower lamport', () => {
   const w = v1World();
@@ -317,26 +330,18 @@ test('eviction cannot un-revoke, un-own, or un-grant a colony', () => {
   assert.ok(s.auth.revokes.size > 0, 'the revocation must still be in force');
 });
 
-test('a frontier survives a recomputation that happens after eviction', () => {
-  // relink() resets to `floor - 1` and walks up, so the first block it looks at needs the
-  // hash and lamport of its predecessor — which eviction has just deleted. Nothing
-  // exercised that before, because a full recomputation only ran on a fork and the
-  // eviction tests never forked. Authority made recomputation common.
-  const w = v1World({ ownerTraffic: 30 });
-  const all = [w.genesis, w.grant, ...w.mBefore, ...w.traffic, w.revoke];
-  const each = all[0].cert.length + all[0].payload.length;
-
-  const s = new Substrate({ maxBytes: each * 8 });
-  load(s, all);
-  const or = s.replica(w.O.logId.toString('hex'));
-  const before = or.linkedTo;
-  assert.ok(or.floor > 0, 'the test is pointless unless eviction actually ran');
-
-  // Any control block linking re-resolves every frontier from the floor up.
-  load(s, [w.replay]);
-  assert.equal(s.replica(w.O.logId.toString('hex')).linkedTo, before,
-    "the owner's frontier must not collapse just because old history was forgotten");
-});
+// The review deleted a test here, and it was right to. "a frontier survives a
+// recomputation that happens after eviction" never triggered one: it captured the
+// frontier AFTER the ROLE_REVOKE had already been inserted — the only thing in the
+// scenario that re-resolves anything — and then inserted a plain MESSAGE, which routes
+// through the cheap local relink and never touches the owner's replica at all. The
+// assertion compared the owner's frontier to itself with nothing happening in between and
+// passed whether or not R4b's floor witness existed.
+//
+// I half-knew: when I falsified the floor witness earlier, this test did not fail, and I
+// wrote the real one in sync.test.js ("a forgotten predecessor does not collapse the
+// frontier on recompute") instead of removing this one. A test that cannot fail is worse
+// than no test, because it reads like coverage.
 
 test('a colony cannot be hijacked by minting a genesis block for its scope', () => {
   // scope_id has to be derived from the founder, or "who owns this colony" is decided by
@@ -494,4 +499,145 @@ test('a revocation does not un-link itself by stalling the log it lives in', () 
     "the owner's own log must not be stranded by the revocation it wrote");
   assert.ok(s.auth.revokes.size > 0, 'and the revocation must still be in force');
   void m2;
+});
+
+// --- what the adversarial review found -----------------------------------------------
+
+test('review: a fork below the eviction floor stops the log on every replica', () => {
+  // Found by the review, confirmed with a repro, and it is one bug wearing two masks.
+  //
+  // #recordFork clamps chainTo and orderedTo down to the fork seq — and then
+  // #resolveFrontiers resets every frontier to `floor - 1`, two lines later, undoing the
+  // clamp whenever eviction had already carried the floor past the contradiction. The
+  // other mask: #rebuildAuth trusts anything below the floor without ever asking whether
+  // it is above a fork. So a replica that had evicted past a revocation kept honouring it
+  // while a fresh replica, holding the same blocks and the same proof, did not.
+  const O = identity();
+  const M = identity();
+  const scopeId = colonyIdFor(O.logId, 0);
+  const ow = writer(O, scopeId);
+  const mw = writer(M, scopeId);
+
+  const genesis = ow.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('colony') });
+  const early = [];
+  for (let i = 0; i < 3; i++) early.push(ow.push({ payload: Buffer.from(`pre ${i}`.padEnd(60, '.')) }));
+
+  // The author signs seq 4 twice. Only the first branch is ever inserted; the second
+  // arrives later as a proof, the way a fork found by somebody else reaches us.
+  const forkSeq = ow.seq;
+  const branchA = ow.push({ payload: Buffer.from('branch A') });
+  const branchB = forkBlockAt(O, scopeId, forkSeq, branchA, 'branch B');
+
+  const grant = ow.push({ type: TYPE.ROLE_GRANT, payload: encodeGrant({ target: M.logId }) });
+  const mBlocks = [0, 1, 2].map((i) => mw.push({ payload: Buffer.from(`m${i}`), authRef: grant.hash }));
+  const filler = [];
+  for (let i = 0; i < 30; i++) filler.push(ow.push({ payload: Buffer.from(`fill ${i}`.padEnd(60, '.')) }));
+
+  const all = [genesis, ...early, branchA, grant, ...mBlocks, ...filler];
+  const each = all[0].cert.length + all[0].payload.length;
+
+  // Replica FRESH holds everything. Replica TIGHT has evicted well past the fork.
+  const fresh = new Substrate({ maxBytes: 1 << 30 });
+  const tight = new Substrate({ maxBytes: each * 4 });
+  load(fresh, all);
+  load(tight, all);
+  assert.ok(tight.replica(O.logId.toString('hex')).floor > forkSeq,
+    'the test is pointless unless eviction carried the floor past the fork');
+
+  for (const s of [fresh, tight]) {
+    const got = s.acceptForkProof(branchA.cert, branchB.cert, O.pub);
+    assert.equal(got.ok, true, got.reason);
+  }
+
+  const key = M.logId.toString('hex');
+  assert.equal(fresh.auth.grants.size, 0, 'a grant above a fork is not a grant');
+  assert.equal(
+    tight.auth.grants.size, fresh.auth.grants.size,
+    'and the replica that had evicted past the fork must agree',
+  );
+  assert.equal(tight.auth.owners.size, fresh.auth.owners.size, 'same for the colony itself');
+
+  // Compared on AUTHORITY rather than on linkedTo. The two replicas ran different byte
+  // budgets, so their floors differ, and linkedTo is reset to floor-1 — history already
+  // delivered and forgotten stays delivered. Eviction is allowed to make those numbers
+  // differ; what it is never allowed to do is make one replica enforce a grant the other
+  // has thrown away, which is the bug this test exists for.
+  assert.equal(fresh.replica(key).linkedTo, -1, 'nothing M wrote under that grant is delivered');
+  const tr = tight.replica(key);
+  assert.ok(tr.linkedTo < tr.floor,
+    `M is linked to ${tr.linkedTo}, above its own floor ${tr.floor} — that is new delivery`);
+});
+
+test('review: a dep evicted before its citer ever arrived still resolves', () => {
+  // The review's sharpest finding, and it falsifies a comment I wrote. depLamports was
+  // introduced as a fallback for "we answered this once before the evidence went" — true
+  // of a citer we already hold, false for one that turns up AFTER the eviction, which
+  // never got the chance to answer it. That citer stalls forever on one replica and links
+  // on another, from the same blocks, which is the fatal shape.
+  const W = identity();
+  const X = identity();
+  const ww = writer(W, Buffer.alloc(16));
+  const xw = writer(X, Buffer.alloc(16));
+
+  const dep = ww.push({ payload: Buffer.from('cite me'.padEnd(60, '.')) });
+  const flood = [];
+  for (let i = 0; i < 30; i++) flood.push(ww.push({ payload: Buffer.from(`f${i}`.padEnd(60, '.')) }));
+  const citer = xw.push({
+    payload: Buffer.from('citing'),
+    deps: [dep.hash],
+    depLamports: [dep.lamport],
+  });
+
+  const each = dep.cert.length + dep.payload.length;
+  const budget = each * 3;
+
+  // A: the dep is forgotten before the citer is ever seen.
+  const a = new Substrate({ maxBytes: budget });
+  load(a, [dep, ...flood]);
+  load(a, [citer]);
+
+  // B: the citer arrives while the dep is still held, and the flood evicts it afterwards.
+  const b = new Substrate({ maxBytes: budget });
+  load(b, [dep, citer, ...flood]);
+
+  const key = X.logId.toString('hex');
+  assert.equal(a.replica(key).linkedTo, b.replica(key).linkedTo,
+    'the same blocks must deliver the same way whichever order they arrived in');
+  assert.equal(b.replica(key).linkedTo, 0, 'and the citer is deliverable: its dep was real');
+});
+
+test('review: a stranger cannot make a spore rebuild its whole authority on demand', () => {
+  // Any block whose WIRE TYPE is a control type forced a full substrate-wide auth rebuild
+  // plus a reset-and-rewalk of every frontier — before anything asked whether the author
+  // had any authority at all. One free identity, one open hypha, and the cost is O(held)
+  // BLAKE2b hashes per forged block. The bound is not a smaller scan, it is refusing to
+  // rewalk when nothing actually changed, which only the colony owner can cause.
+  const O = identity();
+  const X = identity(); // no standing whatsoever
+  const scopeId = colonyIdFor(O.logId, 0);
+  const ow = writer(O, scopeId);
+  const xw = writer(X, scopeId);
+
+  const setup = [ow.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('colony') })];
+  for (let i = 0; i < 40; i++) setup.push(ow.push({ payload: Buffer.from(`real ${i}`) }));
+
+  const tel = {
+    n: 0,
+    count(name) { if (name === 'substrate.resolved') this.n += 1; },
+    gauge() {}, event() {}, rateOf() { return 0; }, get() { return 0; },
+  };
+  const s = new Substrate({ telemetry: tel, maxBytes: 1 << 30 });
+  load(s, setup);
+
+  const after = tel.n;
+  for (let i = 0; i < 200; i++) {
+    const junk = xw.push({
+      type: TYPE.ROLE_REVOKE,
+      payload: encodeRevoke({ target: O.logId, pinSeq: 0 }),
+    });
+    s.insert(junk.cert, junk.payload, X.pub);
+  }
+  assert.equal(tel.n, after,
+    `${tel.n - after} full re-resolutions bought by a stranger writing blocks in their own log`);
+  assert.equal(s.replica(O.logId.toString('hex')).linkedTo, 40, 'and the owner is unharmed');
 });

@@ -80,6 +80,9 @@ export const MAX_BYTES = 64 * 1024 * 1024;
  * (LogReplica#forgetOldest) and Substrate#rebuildAuth reads exactly these.
  */
 const AUTHORITY = new Set([TYPE.COLONY_GENESIS, TYPE.ROLE_GRANT, TYPE.ROLE_REVOKE]);
+
+/** How many forgotten blocks' positions one replica remembers. See LogReplica#lost. */
+export const LOST_CAP = 4096;
 const KEEP_FOREVER = AUTHORITY;
 
 export class LogReplica {
@@ -100,6 +103,19 @@ export class LogReplica {
     // having to choose between forgetting and re-deriving.
     this.floorHash = null;
     this.floorLamport = 0n;
+    // hash -> lamport for blocks this replica has forgotten.
+    //
+    // depLamports on the citing block was only ever half of this, and the half that
+    // assumed the citer was already here. A block that arrives AFTER its dep was evicted
+    // never got the chance to resolve it live, so it has nothing cached and stalls — on
+    // this replica, forever, while a replica that happened to meet the citer first linked
+    // it. Same blocks, different delivery, which is the shape this substrate exists to
+    // rule out. The review found it and was right; the comment claiming "the question was
+    // asked and answered before the evidence went" was true only of citers we hold.
+    //
+    // A lamport is 8 bytes and a hash key is 64 chars of hex, so this is ~2 KB per
+    // thousand evicted blocks — small, but not free and not unbounded: see LOST_CAP.
+    this.lost = new Map();
     this.bytes = 0;
     this.forgotten = 0;
     this.linkedTo = -1; // highest seq reachable by prev_hash from 0, AND lamport-derived
@@ -157,6 +173,14 @@ export class LogReplica {
       }
       this.bytes -= b.bytes;
       this.forgotten++;
+      // Remember where it sat, so a citer that has not arrived yet can still be ordered.
+      // Bounded, and oldest-out: past the cap a citer genuinely stalls, and that stall is
+      // honest — every replica running the same budget forgot the same thing.
+      this.lost.set(b.hash.toString('hex'), b.lamport);
+      if (this.lost.size > LOST_CAP) {
+        const oldest = this.lost.keys().next().value;
+        this.lost.delete(oldest);
+      }
       return b;
     }
     return null;
@@ -234,7 +258,7 @@ export class LogReplica {
    * 'ok' | 'stall' | 'stop' — the same two-outcome discipline a third time, for the same
    * reason. See Substrate#authCheck.
    */
-  relink(resolve, authOf) {
+  relink(resolve, authOf, lost = () => null) {
     this.pendingDeps = false;
 
     // WALK ONE — ORDERING. prev_hash and lamport, nothing else. Monotone: once a block's
@@ -281,10 +305,14 @@ export class LogReplica {
           if (!dr.ordered) { stalled = true; break; }
           got.push(dr.lamport);
         } else if (b.depLamports && i < b.depLamports.length) {
-          got.push(b.depLamports[i]); // forgotten, but we answered this once
+          got.push(b.depLamports[i]); // we answered this once, while the block was here
         } else {
-          stalled = true;
-          break;
+          // Never answered it, because the dep was forgotten before this block arrived.
+          // The substrate may still remember where it sat; that recollection is the only
+          // thing standing between this citer and a permanent, replica-local stall.
+          const recalled = lost(d.deps[i]);
+          if (recalled === null) { stalled = true; break; }
+          got.push(recalled);
         }
       }
       if (!stalled) {
@@ -341,6 +369,7 @@ export class Substrate extends EventEmitter {
     // Derived authority, rebuilt from the linked set — never accumulated incrementally,
     // because a retraction can withdraw a grant and an accumulator has no way to notice.
     this.auth = { owners: new Map(), grants: new Map(), revokes: new Map() };
+    this.authSig = null;
   }
 
   /**
@@ -356,6 +385,19 @@ export class Substrate extends EventEmitter {
     const b = r?.get(at.seq);
     if (!b) return null;
     return { lamport: b.lamport, ordered: at.seq <= r.orderedTo, replica: r, seq: at.seq, block: b };
+  }
+
+  /**
+   * Where a forgotten block sat, if any replica still remembers. Anything evicted was
+   * below a frontier, so its position was settled and is not re-derivable — only recalled.
+   */
+  lostLamport(depHash) {
+    const key = Buffer.from(depHash).toString('hex');
+    for (const r of this.logs.values()) {
+      const l = r.lost.get(key);
+      if (l !== undefined) return l;
+    }
+    return null;
   }
 
   /**
@@ -487,6 +529,19 @@ export class Substrate extends EventEmitter {
     }
 
     this.auth = { owners: new Map([...owners].map(([k, v]) => [k, v.key])), grants, revokes };
+
+    // A signature of what was DERIVED, so a caller can tell a real authority change from a
+    // stranger shouting into their own log. Sorted, so it is a function of the content and
+    // never of Map iteration order — which is insertion order, which is arrival order.
+    const parts = [];
+    for (const [scope, o] of [...owners].sort()) parts.push(`o:${scope}:${o.key}`);
+    for (const [h, g] of [...grants].sort()) parts.push(`g:${h}:${g.target}:${g.scope}`);
+    for (const [t, list] of [...revokes].sort()) {
+      for (const pin of list.slice().sort((a, b) => a.pinSeq - b.pinSeq)) {
+        parts.push(`r:${t}:${pin.scope}:${pin.pinSeq}`);
+      }
+    }
+    return parts.join('|');
   }
 
   /**
@@ -500,13 +555,14 @@ export class Substrate extends EventEmitter {
   #relinkAll(seed) {
     const resolve = (h) => this.resolveDep(h);
     const authOf = (r, seq, d) => this.#authCheck(r, seq, d);
+    const lostOf = (h) => this.lostLamport(h);
     const out = new Map();
     let round = [seed];
     for (;;) {
       let moved = false;
       for (const r of round) {
         const wasOrdered = r.orderedTo;
-        const got = r.relink(resolve, authOf);
+        const got = r.relink(resolve, authOf, lostOf);
         if (r.orderedTo > wasOrdered) moved = true; // ordering unblocks deps too
         if (!got.length) continue;
         moved = true;
@@ -638,8 +694,12 @@ export class Substrate extends EventEmitter {
     // The trigger is ARRIVAL, not linking: authority is read from the chain now, so a
     // revocation counts the moment its chain joins, and waiting for it to link is the
     // cycle described in #resolveFrontiers.
-    if (reachedAuthority) {
-      this.#resolveFrontiers();
+    // A full re-resolution only when the authority actually CHANGED. When it did not —
+    // which is every forged control block from someone with no standing — this falls
+    // through to the ordinary local relink, so the block still links if it deserves to.
+    // Skipping both was the first version of this and it was worse than the DoS: an
+    // authority block that changed nothing simply never linked.
+    if (reachedAuthority && this.#resolveFrontiers()) {
       this.#trim();
       return { ok: true, seq, linked: this.#linkedSince(r, seq) };
     }
@@ -718,7 +778,7 @@ export class Substrate extends EventEmitter {
    * by the opposite route: the revocation LINKS, and blocks that were linked above its pin
    * have to come back out. Same machinery, same event.
    */
-  #resolveFrontiers() {
+  #resolveFrontiers(force = false) {
     const before = new Map();
     for (const r of this.logs.values()) before.set(r, r.linkedTo);
 
@@ -739,10 +799,21 @@ export class Substrate extends EventEmitter {
     // by this author, and where in their log, is settled by the signature and prev_hash.
     // It has nothing to do with whether an earlier block of theirs has had its lamport
     // confirmed against somebody else's log, and it never should have waited on one.
-    this.#rebuildAuth();
+    //
+    // And if it derives the SAME authority as last time, stop here. Recomputing frontiers
+    // is O(held) with two BLAKE2b hashes per block re-walked, and the trigger upstream is
+    // a block's wire TYPE — so before this check, any stranger could mint ROLE_REVOKE
+    // blocks in their own log, none of which mean anything, and buy a full substrate-wide
+    // re-resolution with each one. The bound is not a cheaper scan; it is refusing to
+    // rewalk when nothing changed, which only someone who really holds authority can cause.
+    const sig = this.#rebuildAuth();
+    if (sig === this.authSig && !force) return false; // nothing to re-resolve; caller relinks
+    this.authSig = sig;
+    this.tel?.count('substrate.resolved');
 
     const resolve = (h) => this.resolveDep(h);
     const authOf = (r, seq, d) => this.#authCheck(r, seq, d);
+    const lostOf = (h) => this.lostLamport(h);
     for (const r of this.logs.values()) {
       r.linkedTo = r.floor - 1;
       r.orderedTo = r.floor - 1;
@@ -765,7 +836,7 @@ export class Substrate extends EventEmitter {
         // It is here because it is the same bug in the sibling loop, not because a test
         // demanded it — said plainly rather than left to look load-bearing.
         const wasOrdered = r.orderedTo;
-        if (r.relink(resolve, authOf).length || r.orderedTo > wasOrdered) moved = true;
+        if (r.relink(resolve, authOf, lostOf).length || r.orderedTo > wasOrdered) moved = true;
       }
       if (!moved) break;
     }
@@ -777,6 +848,7 @@ export class Substrate extends EventEmitter {
       this.tel?.count('substrate.retracted', seqs.length);
       this.emit('retracted', { logId: r.logId, seqs: seqs.reverse() });
     }
+    return true;
   }
 
   #recordFork(r, seq, keptHash, otherHash, certA, certB) {
@@ -793,6 +865,23 @@ export class Substrate extends EventEmitter {
       // stop counting, which is the point of stopping the log there at all.
       if (r.chainTo >= seq) r.chainTo = seq - 1;
       if (r.orderedTo >= seq) r.orderedTo = seq - 1;
+
+      // AND THE FLOOR COMES DOWN TOO. Clamping the frontiers here is useless on its own,
+      // because #resolveFrontiers resets them to `floor - 1` about two lines later: on a
+      // replica whose eviction had already carried the floor past this seq, the reset put
+      // the frontier straight back ABOVE the fork and undid the clamp. The same gap let
+      // #rebuildAuth keep honouring a revocation that sat below the floor but above the
+      // contradiction, because "below the floor" was trusted without ever asking about
+      // forkedAt. One replica went on enforcing a grant that another had thrown away.
+      //
+      // The floor means "the bottom of what can still be chain-verified", and a fork means
+      // nothing at or above it can be. So the floor cannot outrank the fork. The witness
+      // goes with it: it described a block on a branch we no longer stand behind.
+      if (r.floor > seq) {
+        r.floor = seq;
+        r.floorHash = null;
+        r.floorLamport = 0n;
+      }
     }
 
     this.tel?.count('substrate.equivocation');
@@ -801,7 +890,7 @@ export class Substrate extends EventEmitter {
 
     // Every frontier, not just this log's. A fork withdraws history other logs may have
     // linked against, and that can cascade further. #recomputeAll emits the retractions.
-    if (lowered) this.#resolveFrontiers();
+    if (lowered) this.#resolveFrontiers(true);
     return lowered;
   }
 

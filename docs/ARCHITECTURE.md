@@ -1127,6 +1127,47 @@ Not fixed, and not introduced by any of this: **a fork at a seq already evicted 
 be detected**, because detection is a collision at that seq and nothing is left to collide
 with. That is a property of forgetting.
 
+**R4e. The eviction floor can never outrank a fork, and a forgotten block's position is
+remembered.** Both found by adversarial review with working repros, both fatal, both the
+same shape as everything else in §1.19's family: a bound that was stated in a comment
+rather than enforced in code.
+
+*The fork below the floor.* `#recordFork` clamps `chainTo` and `orderedTo` to the fork seq
+— and `#resolveFrontiers` then resets every frontier to `floor - 1`, which on a replica
+that had already evicted past the contradiction put them straight back above it. The same
+gap let `#rebuildAuth` keep honouring a revocation sitting below the floor but above the
+fork, because "below the floor" was trusted without ever asking about `forkedAt`. Two
+replicas, same blocks, same proof, opposite answers about who held a role. **The floor now
+comes down with the fork**, and the floor witness goes with it: it described a block on a
+branch we no longer stand behind.
+
+*The dep forgotten before its citer arrived.* R4d's `depLamports` witness carried a comment
+claiming "eviction only takes blocks below a frontier, so anything citing them had already
+ordered them". True of a citer already held; **false for one that arrives afterwards**,
+which never had the chance to resolve it live and so has nothing cached. It stalled
+permanently on that replica while another, which happened to meet the citer first, linked
+it. A replica now keeps `hash → lamport` for what it forgets, capped at `LOST_CAP = 4096`
+with oldest-out; past the cap a citer genuinely stalls, and that stall is honest because
+every replica on the same budget forgot the same thing.
+
+**R4f. Re-resolution runs only when the derived authority actually changed.** The trigger
+for a full substrate-wide rebuild was a block's *wire type*, evaluated before anything
+asked whether its author had standing — so one free identity could mint `ROLE_REVOKE`
+blocks in its own log and buy an O(held) rewalk, two BLAKE2b hashes per block, with each
+one. The bound is not a cheaper scan: it is refusing to rewalk when the derived authority
+is byte-identical to last time, which only someone who really holds authority can change.
+A block whose authority changes nothing falls through to the ordinary local relink, so it
+still links if it deserves to — skipping both was the first attempt and was worse than the
+DoS, because an authority block that changed nothing then never linked at all.
+
+**R5. Glass stays loopback-only. Viewing a spore from another device is what the mesh is.**
+The obvious convenience — bind the LAN so a phone can watch a laptop's spore — is building
+a second, worse copy of the hypha in HTTP, with a URL token standing in for a Noise
+handshake. R3 already settled that the mesh runs *on* Android: the phone runs its own
+spore, joins the colony, and sees it in its own glass, authenticated by the protocol that
+exists for exactly that. A spore holds a mesh identity and other people's traffic, and a
+debug surface that speaks HTTP to the network is the easiest thing in this repo to attack.
+
 ## Open Decisions
 
 These require a human call; each has options and a recommendation, not a default.
