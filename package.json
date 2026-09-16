@@ -1,0 +1,15 @@
+{
+  "name": "spore",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An off-web mycelial mesh. Runs on one phone. Grows faster as it spreads.",
+  "engines": { "node": ">=24" },
+  "bin": { "spore": "./bin/spore.js" },
+  "scripts": {
+    "start": "node bin/spore.js",
+    "bench": "node bench/curve.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {}
+}
