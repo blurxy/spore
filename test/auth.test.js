@@ -817,3 +817,97 @@ test('re-grant: a restored member must cite the new grant, not the revoked one',
   assert.equal(okBefore.length, 2);
   assert.ok(stale.seq === 2 && rev.seq < g2.seq);
 });
+
+// ---------------------------------------------------------------------------------------
+// Review round 2 found these. One root cause, three directions, and it is the bug the
+// re-grant commit itself introduced: #authCheck answers "which statement governs this seq"
+// by BOUNDARY, then answers "was the cited grant superseded" by OWNER-LOG WRITE ORDER.
+// R6 says there is exactly one rule so that the two can never disagree. They disagreed.
+//
+// The reason no existing test caught it, and the reason the property fuzzer could not:
+// test/property.test.js always emits the revocation BEFORE the optional re-grant, so
+// ownerSeq(revoke) < ownerSeq(grant) in every run it can generate. Boundary order and
+// owner-log order therefore never diverge there, and divergence is what both bugs need.
+// More seeds would not have found this. A different generator would.
+// ---------------------------------------------------------------------------------------
+
+test('re-grant: a revocation that reaches lower than the grant does not supersede it', () => {
+  // FALSE STOP. The owner grants from seq 5, then writes a revocation pinned at 1 — later
+  // in their own log, but reaching a range that ENDS before the grant's range begins. The
+  // two statements do not overlap at all, so the revocation has nothing to say about seq 5.
+  //
+  // Ordering by write position alone says "the revoke is the owner's newer word, so it
+  // wins". That is the wrong question: newer about WHAT? A revocation is a statement about
+  // a range, and this one's range stops at seq 1.
+  const c = colony();
+  const g1 = c.grant(5);    // boundary 5,  ownerSeq 1
+  const rev = c.revoke(1);  // boundary 2,  ownerSeq 2 — written later, reaches lower
+  const early = [0, 1, 2, 3, 4].map((i) => c.mw.push({ payload: Buffer.from(`q${i}`) }));
+  const under = c.mw.push({ payload: Buffer.from('granted from five'), authRef: g1.hash });
+
+  const s = new Substrate();
+  load(s, [...c.blocks, g1, rev, ...early, under]);
+
+  assert.equal(under.seq, 5, 'the block sits exactly at the grant boundary');
+  assert.equal(s.replica(c.M.logId.toString('hex')).linkedTo, 5,
+    'the grant governs seq 5 and no revocation reaches it; the block must deliver');
+  assert.equal(early.length, 5);
+});
+
+test('re-grant: a grant the owner cut off cannot be cited, even if written after the cut', () => {
+  // FALSE OK, the mirror image. The owner revokes first (boundary 3), THEN writes a grant
+  // pinned at 0 — a grant that is newer in the log but whose range was already carved out
+  // by the revocation above it — and finally the real restoring grant at boundary 4.
+  //
+  // A member citing that middle grant at seq 4 is citing authority the owner's own
+  // revocation had already withdrawn. Comparing write order lets it through, because the
+  // revocation was written FIRST and so has the lower ownerSeq.
+  const c = colony();
+  const rev = c.revoke(2);  // boundary 3,  ownerSeq 1 — written first
+  const g1 = c.grant(0);    // boundary 0,  ownerSeq 2 — newer in the log, older in range
+  const g2 = c.grant(4);    // boundary 4,  ownerSeq 3 — the actual restoring grant
+  const early = [0, 1, 2, 3].map((i) => c.mw.push({ payload: Buffer.from(`e${i}`) }));
+  const stale = c.mw.push({ payload: Buffer.from('old papers'), authRef: g1.hash });
+
+  const s = new Substrate();
+  load(s, [...c.blocks, rev, g1, g2, ...early, stale]);
+
+  assert.equal(stale.seq, 4, 'seq 4 is governed by g2, the restoring grant');
+  assert.equal(s.replica(c.M.logId.toString('hex')).linkedTo, 3,
+    'but it cites g1, which the revocation cut off — a revocation must not be citable past');
+  assert.notEqual(g2.hash.toString('hex'), g1.hash.toString('hex'));
+});
+
+test('re-grant: a spent revocation does not reach forward past the grants that replaced it', () => {
+  // The layered case, and the one with real teeth: FOUR overlapping statements where
+  // boundary order and owner-log order disagree in the middle.
+  //
+  //   g0      boundary 0   ownerSeq 1     covers the member from the start
+  //   gFuture boundary 10  ownerSeq 2     covers seq 10 onward
+  //   rEarly  boundary 3   ownerSeq 3     cuts at seq 3 — and is itself replaced below
+  //   gMid    boundary 3   ownerSeq 4     restores at seq 3, same boundary, later word
+  //
+  // rEarly has the second-highest ownerSeq of the lot, so under write-order comparison it
+  // supersedes gFuture — a grant whose range starts seven seqs ABOVE where rEarly's ends,
+  // and which rEarly could not possibly have been speaking about. The member's entire log
+  // from seq 10 up is stranded permanently, on every replica, deterministically.
+  const c = colony();
+  const g0 = c.grant(0);
+  const gFuture = c.grant(10);
+  const rEarly = c.revoke(2);  // boundary 3
+  const gMid = c.grant(3);     // boundary 3, later in the owner's log — so it wins the tie
+
+  const m = [];
+  for (let i = 0; i < 3; i++) m.push(c.mw.push({ payload: Buffer.from(`a${i}`), authRef: g0.hash }));
+  for (let i = 3; i < 10; i++) m.push(c.mw.push({ payload: Buffer.from(`b${i}`), authRef: gMid.hash }));
+  for (let i = 10; i < 16; i++) m.push(c.mw.push({ payload: Buffer.from(`c${i}`), authRef: gFuture.hash }));
+
+  const s = new Substrate();
+  load(s, [...c.blocks, g0, gFuture, rEarly, gMid, ...m]);
+
+  const mr = s.replica(c.M.logId.toString('hex'));
+  assert.equal(m[m.length - 1].seq, 15);
+  assert.equal(mr.chainTo, 15, 'the chain itself is intact — this is purely an authority question');
+  assert.equal(mr.linkedTo, 15,
+    'a revocation spent at seq 3 has nothing to say about a grant that begins at seq 10');
+});

@@ -485,6 +485,16 @@ export class Substrate extends EventEmitter {
     // The owner has said nothing that reaches this seq. STALL: they may yet, and deciding
     // against the author now would make the answer depend on what has arrived.
     if (!governing) return 'stall';
+    // NO TEST DIES IF YOU DELETE THIS LINE, and that is now true by construction rather
+    // than by oversight. To get past it a block must cite a grant we hold, that is ours,
+    // is a grant, targets this log and matches scope — and any revocation governing this
+    // seq necessarily sorts after that grant, so the supersession loop below returns stop
+    // too. Mutation-tested: removed, the full suite still passes.
+    //
+    // Kept anyway, as the plain statement of the rule at the point it is decided, and
+    // deliberately not defended by a test that could only be a tautology. It is redundant
+    // BECAUSE the loop below is correct; if that loop is ever changed, this stops being
+    // redundant, which is the reason not to delete it now.
     if (governing.kind === 'revoke') return 'stop';
 
     // Governed by a grant. The cited one must be IN FORCE here — covering this seq, and
@@ -499,9 +509,19 @@ export class Substrate extends EventEmitter {
     const cited = list.find((e) => e.kind === 'grant' && e.hash === ref);
     if (!cited) return 'stall';               // held, ours, but not yet chain-reachable
     if (cited.boundary > seq) return 'stop';  // that grant does not reach this far back
+    // Superseded BY THE SAME ORDERING the governing lookup above used, and that is the
+    // whole point. Asking this question by owner-log position instead was two rules for
+    // one question — the exact thing the single ordered list in #rebuildAuth exists to
+    // prevent — and it was wrong in both directions: a revocation whose range ended below
+    // a later grant's range still cancelled it, and a revocation written before a grant
+    // never cancelled it however far its range reached. ownerSeq breaks a tie at EQUAL
+    // boundary. It is not the comparison.
     for (const e of list) {
       if (e.boundary > seq) break;
-      if (e.kind === 'revoke' && e.ownerSeq > cited.ownerSeq) return 'stop'; // superseded
+      if (e.kind !== 'revoke') continue;
+      const after = e.boundary > cited.boundary
+        || (e.boundary === cited.boundary && e.ownerSeq > cited.ownerSeq);
+      if (after) return 'stop'; // the owner withdrew this grant before this block was written
     }
     return 'ok';
   }

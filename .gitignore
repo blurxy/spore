@@ -2,3 +2,7 @@ node_modules/
 .spore/
 *.log
 bench/out/
+
+# Agent worktrees created by Claude Code workflow isolation. Live checkouts may be
+# in here while a review runs — never git clean this directory.
+.claude/worktrees/
