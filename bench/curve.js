@@ -100,6 +100,7 @@ function runSwarm({
     downloading: new Set(),      // blocks I am pulling, all peers
     uploading: new Set(),        // blocks I am serving
     outstanding: new Map(),      // peerId -> Set(index) I have asked THAT peer for
+    servedBy: new Map(),         // peerId -> blocks that peer actually supplied
   });
   for (let i = 0; i < seeders; i++) spores.push(mkSpore(`seed${i}`, true));
   for (let i = 0; i < joiners; i++) spores.push(mkSpore(`join${i}`, false));
@@ -206,6 +207,7 @@ function runSwarm({
         // cache-on-fetch: the joiner immediately becomes a source for this block.
         // This is where swarm supply grows, and it is the whole mechanism.
         if (x.to.have.set(x.index)) replicas[x.index]++;
+        x.to.servedBy.set(x.peerId, (x.to.servedBy.get(x.peerId) || 0) + 1);
         inflight.set(x.index, Math.max(0, (inflight.get(x.index) || 1) - 1));
         x.to.downloading.delete(x.index);
         x.to.outstanding.get(x.peerId)?.delete(x.index);
@@ -218,7 +220,18 @@ function runSwarm({
   }
 
   const finished = spores.filter((s) => !s.seeder && s.have.complete);
+
+  // How concentrated the fetch was, for the first joiner. The speedup column above is
+  // arithmetic — supply is COMPUTED as min(n x UPLINK, CELL, DOWNLINK), never measured —
+  // so a curve could in principle show 3.55x while the scheduler pulled everything from
+  // one peer and the number came from somewhere else. This makes the proof direct.
+  const sample = spores.find((s) => !s.seeder);
+  const shares = sample ? [...sample.servedBy.values()].sort((a, b) => b - a) : [];
+  const supplied = shares.reduce((a, b) => a + b, 0);
+
   return {
+    sources: shares.length,
+    topShare: supplied ? shares[0] / supplied : 0,
     ms: t,
     cohortMs: finished.length ? Math.max(...finished.map((s) => s.doneAt)) : Infinity,
     firstMs: finished.length ? Math.min(...finished.map((s) => s.doneAt)) : Infinity,
@@ -312,11 +325,25 @@ for (const n of Ns) {
   const swarm = runSwarm({ seeders: n, joiners: 1, cellCap: true, seed: 7 });
   const speedup = ctrlA.cohortMs / swarm.firstMs;
   const supply = Math.min(n * mb(UPLINK), mb(CELL), mb(DOWNLINK));
-  rows.push({ n, speedup, ms: swarm.firstMs });
+  rows.push({ n, speedup, ms: swarm.firstMs, topShare: swarm.topShare, sources: swarm.sources });
   console.log(
     `  ${String(n).padStart(2)}   ${fmt(swarm.firstMs / 1000).padStart(6)}s   ${(fmt(speedup, 2) + 'x').padStart(7)}`
     + `   ${fmt(supply, 2).padStart(11)}   ${String(swarm.dup).padStart(3)}`,
   );
+}
+
+console.log();
+
+// The direct check. If the shipped scheduler concentrated on one peer, every speedup in
+// the table above would be a number produced by arithmetic rather than by a swarm, and
+// the hardware harness would flatten to 1.0x for a reason nothing here would have shown.
+{
+  const spread = rows.filter((r) => r.n >= 2);
+  const worst = spread.reduce((a, r) => (r.topShare > a.topShare ? r : a), spread[0]);
+  const evenly = spread.every((r) => r.topShare <= 0.8);
+  pulse(`load spread · worst case N=${worst.n}: top source supplied ${(worst.topShare * 100).toFixed(0)}% of blocks`);
+  pulse(`             ${evenly ? 'every multi-source run drew from several peers — the speedup is a swarm'
+    : 'AT LEAST ONE RUN WAS ONE UPLINK WEARING A SWARM COSTUME'}`);
 }
 
 console.log();
