@@ -959,3 +959,38 @@ test('review: an eviction floor cannot outrank a revocation boundary', () => {
     `arrival order decided the frontier: ${la} when the revocation arrived last, ${lb} when it arrived first`);
   assert.equal(la, 3, 'and the honest answer is the revocation boundary minus one');
 });
+
+test('review: clamping the floor to a revocation costs ordering — characterised, not desired', () => {
+  // THIS TEST ASSERTS CURRENT BEHAVIOUR, NOT CORRECT BEHAVIOUR. It exists so the cost is a
+  // fact in the suite rather than a paragraph someone has to find, and so that anyone who
+  // fixes it gets a failure pointing straight at ARCHITECTURE.md R7.
+  //
+  // The floor governs chain-verification and ORDERING as well as delivery. Bringing it down
+  // to a revocation boundary is therefore a bigger hammer than the problem: seq 9 below is
+  // held and chain-verified, and stops being orderable purely because the blocks between it
+  // and the lowered floor were already evicted. Other logs' deps resolve against orderedTo,
+  // so a log that did nothing wrong can stall on this.
+  //
+  // The obvious alternative was built and rejected: bounding linkedTo alone drives it below
+  // floor - 1, and forgetOldest iterates [floor, linkedTo), so a revoked log stops being
+  // evictable at all. Two rules genuinely conflict once the floor climbs past a boundary,
+  // and the real fix is a deterministic eviction floor — an SP2 storage question, not a
+  // patch to #resolveFrontiers.
+  const c = colony();
+  const g = c.grant(0);
+  const m = [];
+  for (let i = 0; i < 10; i++) m.push(c.mw.push({ payload: Buffer.from(`m${i}`), authRef: g.hash }));
+  const rev = c.revoke(3); // boundary 4
+
+  const width = m[0].cert.length + 8;
+  const s = new Substrate({ maxBytes: width * 3 });
+  load(s, [...m, ...c.blocks, g, rev]);
+
+  const r = s.replica(c.M.logId.toString('hex'));
+  assert.equal(r.linkedTo, 3, 'delivery is correct: the revocation boundary minus one');
+  assert.ok(r.blocks.has(9), 'seq 9 is still held');
+  assert.equal(r.chainTo, 9, 'and still chain-verified');
+  assert.equal(r.orderedTo, 3,
+    'but not orderable — THE COST. If this now reads 9, the ordering problem has been '
+    + 'fixed and ARCHITECTURE.md R7 should lose its residual paragraph.');
+});

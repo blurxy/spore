@@ -1211,6 +1211,67 @@ two payloads now share a layout, so length no longer distinguishes them: the blo
 does, at header offset 1, inside the signed region. Length-sniffing was never the real
 defence; it worked by coincidence while the two differed.
 
+**R7. Second review round: the rule was read two ways, and the tests could not tell.**
+Five lenses over the substrate after R6 landed, each strongest finding adversarially
+verified, then the rest hand-triaged and a second skeptic pass over what survived. Ten of
+twelve findings confirmed, one refuted, one minor. The three worst are below; the fourth
+entry is the one that matters most, and it is not a bug.
+
+*Supersession asked the question by the wrong key.* `#authCheck` computed **which statement
+governs this seq** by boundary, then computed **was the cited grant superseded** by the
+owner's log-write order. R6 exists so there is exactly one rule and the two can never
+disagree — and they disagreed, in the commit that introduced R6. Wrong in both directions:
+a revocation pinned at 1 cancelled a grant covering seq 5 (whose range begins four seqs
+above where the revocation's ends), and a revocation written before a grant never cancelled
+it however far its range reached. The layered case stranded six blocks of a sixteen-block
+log permanently, on every replica, deterministically. `ownerSeq` breaks a tie at EQUAL
+boundary; it is not the comparison. Found independently by three of five lenses.
+
+*`MAX_SEQ` was enforced everywhere except where seq is used.* `decodePairs` and `decodeHave`
+checked it; BLOCK never did, because its seq lives inside the signed cert and never passes
+through either. That is the one message type that sizes `LogReplica#bits`. A single
+~300-byte signed block requested a ~596 MB buffer, and ~59.6 GB was also accepted. Desktop
+overcommit makes that nearly free, which is exactly why nothing noticed; the target is a
+phone. Now enforced at `insert()` — the single funnel every block passes through — and
+ahead of `ensure()`, which was minting a replica for blocks about to be refused.
+
+*The floor could outrank a revocation boundary.* R4e's sentence about forks, never written
+for revocations. Under a tight budget a member delivered and then evicted before the
+owner's word arrives leaves the floor ABOVE the boundary; `#resolveFrontiers` resets every
+frontier to `floor - 1`, above everything the revocation was about, so the rewalk never
+examines a revoked block. Revocation last: `linkedTo` 8. Revocation first: `linkedTo` 3.
+Both replicas holding that same revocation, which neither can have forgotten because
+AUTHORITY is `KEEP_FOREVER`. The clamp respects supersession — only a boundary whose
+*governing* entry is a revocation stops the log, or re-grant would break outright.
+
+**The residual this leaves, stated rather than discovered later.** Clamping the floor is a
+bigger hammer than the problem: the floor governs chain-verification and ORDERING as well
+as delivery, so dropping it onto an already-evicted seq strands blocks that are held and
+perfectly orderable — `orderedTo` fell from 6 to 2 on a replica holding everything it
+needed, and other logs' deps resolve against `orderedTo`. The obvious alternative, bounding
+`linkedTo` alone and leaving the floor be, was built and rejected: it drives `linkedTo`
+below `floor - 1`, and `forgetOldest` iterates `[floor, linkedTo)`, so a revoked log stops
+being evictable at all. Two rules genuinely conflict once the floor climbs past a boundary
+— *you cannot un-deliver what you have already forgotten* and *you cannot claim delivery of
+blocks your own revocation stops* — and neither instrument expresses only what is meant.
+The floor clamp is what ships, its ordering cost is characterised by a test that asserts
+the current behaviour, and the real fix is a deterministic eviction floor, which is an SP2
+storage question and not a patch to `#resolveFrontiers`.
+
+*Beneath all of it: agreement is not correctness.* Every property in `test/property.test.js`
+asserted CONVERGENCE — replicas fed the same blocks in any order reach the same state. The
+supersession bug was deterministic, so every replica computed the identical wrong verdict,
+agreed perfectly, and passed every seed. No generator and no number of seeds could have
+found it, because the property being checked was not the property being violated. That gap
+covered every authority rule in the codebase, not just this one. The fuzzer was separately
+blind in two ways worth recording — it emitted the revocation before the re-grant
+unconditionally, so boundary order and owner-log order never diverged; and members could
+only ever cite the first grant, so the supersede path was unreachable. Both are fixed, and
+an oracle now checks the frontier against a second, deliberately naive reading of the same
+rule list. It is a regression oracle, not a discovery oracle: it catches a CONSUMER
+diverging from the rule the PRODUCER built, which is what this bug was. If R6 itself is
+wrong, both readings are wrong together and it stays silent.
+
 ## Open Decisions
 
 These require a human call; each has options and a recommendation, not a default.
