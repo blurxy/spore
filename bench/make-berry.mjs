@@ -77,10 +77,16 @@ SUBSTRATE
     log_id = BLAKE2b-256(author_ed25519_pub)[0..16]
   It sits at header offset 4, inside the signed region, in every block. This exists
   because replication means verifying Alice's signature against a key handed to you
-  by Bob, and a random log id gives you no way to know it is the right key. Two
-  checks, unforgeable together: the signature verifies under the supplied key, AND
-  that key hashes to the log_id the block claims. Claiming someone else's log needs
-  a 128-bit preimage on their public key.
+  by Bob, and a random log id gives you no way to know it is the right key.
+  THE FIRST BLOCK BINDS THE KEY. Every block after it must verify under the key the
+  replica already recorded, never under one the message supplies.
+  An earlier version of this spec claimed the binding meant claiming someone else's
+  log needed a 128-bit preimage. It did not. The binding ran only when a replica was
+  CREATED, so after block zero any peer could sign a block naming your log_id under
+  their own key and it was accepted, chained and linked. The signature was real; it
+  simply was not yours. Which key may sign is a property of the LOG, not something
+  a message gets to assert, so the log is resolved first and the replica's own key is
+  the only one that verifies anything.
   196-byte cert, little-endian:
     0 1 ver   1 1 type   2 2 flags   4 16 log_id   20 8 seq   28 8 lamport
     36 8 wall_ms (ALWAYS ZERO — no NTP off-web)   44 16 scope_id
@@ -93,8 +99,25 @@ SUBSTRATE
   The signature covers payload_hash, not the payload: a 40MB block is still a
   260-byte cert, and redaction drops bytes without breaking any proof.
   ORDER(B) = (lamport, log_id lexicographic, seq). Total, deterministic, no clock.
-  lamport = 1 + max(own previous, all deps), DERIVED and rejected if asserted.
-  That closes the inflation attack: you cannot declare lamport = 2^60.
+  lamport = 1 + max(own previous, all deps), and it is CHECKED AT LINK TIME — the
+  same moment prev_hash is, and for the same reason: you cannot evaluate the rule
+  without holding the previous block. Two behaviours, and the difference is the
+  whole design:
+    STALL  a dep not held, or held but not yet LINKED, pauses promotion until it
+           links. Reading an unlinked dep's lamport means trusting the exact number
+           we are trying not to trust.
+    STOP   a lamport that is not the derived value halts the frontier at seq-1,
+           permanently and identically on every replica. Rejecting the block instead
+           would make the outcome depend on arrival order.
+  Deps may point into ANY log, so the check is substrate-wide and relinking loops
+  until nothing moves: linking one log can unblock another.
+  THE CONSEQUENCE IS THE INTERESTING PART. A lamport is only worth checking if the
+  receiver can RECOMPUTE it, so every input must be cited as a dep. A spore that
+  absorbs other spores' lamports into a private counter and stamps that is asserting
+  a number nobody else can reproduce. That is what this implementation did, and the
+  inflation attack this spec previously claimed was closed was wide open: nothing
+  compared the field to anything, and one spore declaring 2^60 dragged every spore
+  that merely RECEIVED the block to 2^60, forever.
 
   A replica tracks TWO facts about every block and never conflates them:
     held    signature verified under the log's author key. Immediate, order-free.
@@ -107,7 +130,18 @@ SUBSTRATE
   no parallelism, and the speedup below would be arithmetic about a thing that
   cannot happen.
   An author signing two different blocks at one seq is EQUIVOCATION. Both signatures
-  verify; no peer can fake it. Detected, kept as proof, surfaced. Not resolved.
+  verify; no peer can fake it. THE LOG ENDS THERE. Hold both, link neither, pin the
+  frontier below it — every replica that has seen both computes the same stop from
+  the same facts, with no vote and no clock. Keeping whichever arrived first is a
+  convergence bug: arrival order differs per spore, so two honest replicas end up
+  holding different logs under one log_id and never reconcile. The literature calls
+  that partitioning replicas by which branch was replicated first (2P-BFT-Log,
+  Lavoie et al.), and its resolution is the same as this one — agree on the earliest
+  fork point plus an irrefutable proof.
+  FORK_PROOF carries both certs, ~520 bytes, verifiable by anyone with no trust in
+  the messenger. Exactly one entity can manufacture one: the author, about
+  themselves, once. Announce-once needs replay-on-connect, or a fork found alone is
+  broadcast to an empty room and never mentioned again.
 
 SHARDING
   Rarest-first, adapted from BitTorrent. Endgame mode near completion kills the tail.
@@ -130,6 +164,28 @@ SHARDING
   The scheduler runs per log; a peer is one socket. The inflight budget is therefore
   global per peer, or planning two logs independently queues 2x the pipeline depth.
 
+EVERY NUMBER FROM THE WIRE IS AN ALLOCATION REQUEST
+  seq is a u32 and a receiver sizes a bitfield from it, so 23 well-formed bytes
+  claiming a block at 4,294,967,295 allocate 512 MB. On a phone that is not a
+  slowdown, it is the process. MAX_SEQ = 2^24 is enforced in the DECODER, because
+  there is nothing correct a caller can do with a larger number and only one place
+  to forget the check. HAVE's bitlen is bounded the same way.
+  Nothing authorises a log into existence either — any peer names one and state is
+  created for it, and any freely-minted key opens a replica. MAX_LOGS = 256, the
+  same number in the syncer and the substrate. Past 65,536 it would also overflow
+  the u16 log count in HAVE and our own advertisements would start lying.
+
+A PEER THAT STOPS READING IS A PEER THAT IS ATTACKING YOU
+  From Node's own documentation: writing a socket that is not draining may lead to
+  a remotely exploitable vulnerability, because TCP sockets may never drain if the
+  remote peer does not read. So the attack is not a flood. It is ONE request for a
+  large range, and then silence. Capping what you serve per request does not close
+  it — the attacker controls how fast you drain, not how much you send.
+  Over 4 MB of unsent data, the hypha dies. Checked before encrypting, so an
+  over-budget hypha never burns a nonce on a frame it will not send. Same posture as
+  "any AEAD failure is fatal": not draining is dead or hostile, and a queue held on
+  a peer's behalf is a resource it controls for free.
+
 THE BUG ONLY REAL SOCKETS FIND
   TCP coalesces. Write Noise msg3 and the first HAVE back to back and they arrive in
   ONE chunk. A frame reader looping over that chunk feeds msg3 to the handshake,
@@ -144,6 +200,9 @@ THE BUG ONLY REAL SOCKETS FIND
   socket held paused until every listener is attached.
   Neither could fire until something sent immediately after a handshake. A benchmark
   cannot find a bug in the assumptions it was built from.
+  Nor could a unit test find that this implementation started its own log at seq 1
+  while linking looks for genesis at seq 0, so a spore's own log never linked at all.
+  Tests build chains from zero and never go through the append path. Run it.
 
 THE SCALING CLAIM, HONESTLY
   Wi-Fi in infrastructure mode is a SHARED medium; every peer-to-peer byte crosses

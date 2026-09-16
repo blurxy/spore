@@ -44,6 +44,28 @@ export const CERT_MIN = HEADER_LEN + SIG_LEN;
 export const MAX_LOGS = 256;
 
 /**
+ * How many bytes of block data one spore keeps before it starts forgetting.
+ *
+ * Without this the substrate grows forever: every block ever seen, plus a hash index
+ * entry each, with no eviction and no persistence. That was survivable while a spore held
+ * `pulse` traffic. It is not survivable on a phone, and it is invisible to everything we
+ * measure — tests run for seconds, the harness moves 400 blocks. It would surface as a
+ * device dying after a day with nothing pointing at the cause.
+ *
+ * Eviction takes the OLDEST LINKED blocks first, and only strictly below `linkedTo`:
+ *   - below the frontier the history is already verified and delivered, and a peer that
+ *     needs it can fetch it from somebody who still has it;
+ *   - the block AT the frontier must survive, because relink() reads its hash and its
+ *     lamport to validate the next one;
+ *   - above the frontier nothing is evictable, because those blocks are the only reason
+ *     the frontier will ever advance.
+ *
+ * Forgetting a block clears its HAVE bit. A replica that advertises what it cannot serve
+ * is lying to the swarm, and the cost lands on the requester as a wasted round trip.
+ */
+export const MAX_BYTES = 64 * 1024 * 1024;
+
+/**
  * One author's log, as far as this spore has it.
  *
  * `authorPub` is not taken on trust. It is checked against log_id on first sight
@@ -58,6 +80,9 @@ export class LogReplica {
     this.blocks = new Map(); // seq:number -> { cert, payload, hash, lamport }
     this.bits = new Bitfield(1); // held-set, grows with the log
     this.head = -1; // highest seq we hold
+    this.floor = 0; // lowest seq we might still hold; everything below is forgotten
+    this.bytes = 0;
+    this.forgotten = 0;
     this.linkedTo = -1; // highest seq reachable by prev_hash from 0
     this.pendingDeps = false; // frontier is waiting on a dep in another log
     this.forks = new Map(); // seq -> { kept, other } block hashes
@@ -70,6 +95,29 @@ export class LogReplica {
   has(seq) { return this.blocks.has(seq); }
   get(seq) { return this.blocks.get(seq) || null; }
   hashAt(seq) { return this.blocks.get(seq)?.hash || null; }
+
+  /**
+   * Forget the oldest verified block. Returns what was dropped, or null if nothing can be.
+   *
+   * Strictly below linkedTo: the frontier block itself is what relink() chains and derives
+   * the next lamport from, so dropping it would stall the log permanently.
+   */
+  forgetOldest() {
+    for (let s = this.floor; s < this.linkedTo; s++) {
+      const b = this.blocks.get(s);
+      this.floor = s + 1;
+      if (!b) continue;
+      this.blocks.delete(s);
+      if (s < this.bits.size && this.bits.has(s)) {
+        this.bits.bits[s >> 3] &= ~(1 << (s & 7));
+        this.bits.count--;
+      }
+      this.bytes -= b.bytes;
+      this.forgotten++;
+      return b;
+    }
+    return null;
+  }
 
   /** How many blocks we hold strictly below `limit`. Used to measure a forked log. */
   countBelow(limit) {
@@ -149,9 +197,11 @@ export class LogReplica {
  *   'retracted'    { logId, seqs }                       linked history withdrawn behind a fork
  */
 export class Substrate extends EventEmitter {
-  constructor({ telemetry = null } = {}) {
+  constructor({ telemetry = null, maxBytes = MAX_BYTES } = {}) {
     super();
     this.tel = telemetry;
+    this.maxBytes = maxBytes;
+    this.bytes = 0;
     this.logs = new Map(); // logIdHex -> LogReplica
     // block_hash -> { key, seq }. Deps name blocks by hash and may point into ANY log,
     // so validating a dep's lamport needs a substrate-wide index; a replica only sees
@@ -286,13 +336,17 @@ export class Substrate extends EventEmitter {
       return { ok: false, reason: 'equivocation', seq, retracted };
     }
 
+    const bytes = cert.length + payload.length;
     r.blocks.set(seq, {
       cert: Buffer.from(cert),
       payload: Buffer.from(payload),
       hash: b.blockHash,
       lamport: b.lamport,
       type: b.type,
+      bytes,
     });
+    r.bytes += bytes;
+    this.bytes += bytes;
     r.reserve(seq);
     r.bits.set(seq);
     if (seq > r.head) r.head = seq;
@@ -302,6 +356,7 @@ export class Substrate extends EventEmitter {
     this.emit('block', { logId: r.logId, seq, from, block: b, payload });
 
     const promoted = this.#relinkAll(r);
+    this.#trim();
     return { ok: true, seq, linked: promoted };
   }
 
@@ -408,6 +463,41 @@ export class Substrate extends EventEmitter {
       }
     }
     return out;
+  }
+
+  /**
+   * Forget until we are under budget.
+   *
+   * Always from the replica currently holding the most, so a single noisy log cannot push
+   * everyone else's history out. Stops when nothing is evictable — a substrate made
+   * entirely of unlinked blocks cannot shrink, and pretending otherwise by dropping them
+   * would just mean fetching them again.
+   */
+  #trim() {
+    let guard = 0;
+    while (this.bytes > this.maxBytes && guard++ < 100000) {
+      let victim = null;
+      for (const r of this.logs.values()) {
+        if (r.bytes > 0 && (!victim || r.bytes > victim.bytes)) victim = r;
+      }
+      if (!victim) break;
+      const gone = victim.forgetOldest();
+      if (!gone) {
+        // This replica cannot give anything up. Try the next largest that can.
+        const others = [...this.logs.values()].filter((r) => r !== victim && r.linkedTo > r.floor);
+        if (!others.length) break;
+        const next = others.reduce((a, r) => (r.bytes > a.bytes ? r : a), others[0]);
+        const g2 = next.forgetOldest();
+        if (!g2) break;
+        this.bytes -= g2.bytes;
+        this.byHash.delete(g2.hash.toString('hex'));
+        this.tel?.count('substrate.forgotten');
+        continue;
+      }
+      this.bytes -= gone.bytes;
+      this.byHash.delete(gone.hash.toString('hex'));
+      this.tel?.count('substrate.forgotten');
+    }
   }
 
   /** Everything we hold, as HAVE advertisements. One entry per log. */

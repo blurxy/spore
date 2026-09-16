@@ -496,11 +496,18 @@ export class Syncer extends EventEmitter {
     const l = this.logs.get(logKey);
     if (!r || !l) return;
     const total = this.#totalFor(l, r);
-    // Count only what is below the fork. #totalFor already clamps `total` to forkedAt, but
-    // `held` counted every block ever accepted — including ones above the fork, which can
-    // never link and will never be readable. So a forked log could report itself complete
-    // while holding nothing usable past the contradiction.
-    const held = r.forked ? r.countBelow(total) : r.held;
+    // Completion is the FRONTIER reaching the head, not a count of blocks in hand.
+    //
+    // A count was wrong twice over. It included blocks above a fork, which can never link
+    // and will never be readable — so a forked log announced itself complete while holding
+    // nothing usable past the contradiction. And once the substrate started forgetting old
+    // verified history to stay inside its byte budget, the count began going DOWN, so a
+    // long-running spore would have un-completed a log it had fully read.
+    //
+    // linkedTo is immune to both: it is a watermark over validated, contiguous history,
+    // it never moves backwards except behind a fork, and eviction deliberately never
+    // touches anything at or above it.
+    const held = r.linkedTo + 1;
     this.emit('progress', { logId: r.logId, held, total });
     if (total > 0 && held >= total) {
       this.emit('complete', { logId: r.logId, blocks: held });

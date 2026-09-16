@@ -476,6 +476,52 @@ test('store: a real fork proof is accepted no matter who relays it', () => {
   assert.equal(s.replica(id.logId.toString('hex')).linkedTo, 2, 'and still stops the log');
 });
 
+test('store: a substrate under budget pressure forgets, and stays usable', () => {
+  // Before this the substrate grew forever — every block ever seen, plus a hash index
+  // entry each. Tests run for seconds and the harness moves 400 blocks, so nothing we
+  // measure could see it. It would have surfaced as a phone dying after a day.
+  const id = identity();
+  const blocks = chain(id, 60, 'bulk');
+  const per = blocks[0].cert.length + blocks[0].payload.length;
+  const s = new Substrate({ maxBytes: per * 20 });
+
+  for (const b of blocks) assert.ok(s.insert(b.cert, b.payload, id.pub).ok);
+
+  const rep = s.replica(id.logId.toString('hex'));
+  assert.ok(s.bytes <= per * 20, `held ${s.bytes} bytes against a ${per * 20} budget`);
+  assert.ok(rep.forgotten > 0, 'something must actually have been dropped');
+
+  // The frontier is a watermark over validated history and must not move backwards.
+  assert.equal(rep.linkedTo, 59, 'the log is still fully linked');
+  // The block AT the frontier survives: relink() reads its hash and lamport to check the
+  // next one, so dropping it would stall the log forever.
+  assert.ok(rep.has(59), 'the frontier block itself is never evicted');
+  assert.equal(rep.has(0), false, 'but the oldest verified history is gone');
+
+  // And we no longer advertise what we cannot serve.
+  const adv = s.advertise()[0];
+  assert.equal(adv.bits[0] & 1, 0, 'the forgotten block is no longer in our HAVE');
+  assert.equal(s.fetch(id.logId.toString('hex'), 0), null, 'and fetching it returns nothing');
+});
+
+test('store: unlinked blocks are never evicted, because they are why the frontier moves', () => {
+  const id = identity();
+  const blocks = chain(id, 30, 'gap');
+  const per = blocks[0].cert.length + blocks[0].payload.length;
+  const s = new Substrate({ maxBytes: per * 5 });
+
+  // Everything except genesis, so nothing can ever link.
+  for (let i = 1; i < 30; i++) s.insert(blocks[i].cert, blocks[i].payload, id.pub);
+  const rep = s.replica(id.logId.toString('hex'));
+  assert.equal(rep.linkedTo, -1);
+  assert.equal(rep.forgotten, 0, 'a substrate of unlinked blocks cannot shrink');
+  assert.ok(s.bytes > per * 5, 'and it is honest about being over budget rather than dropping them');
+
+  s.insert(blocks[0].cert, blocks[0].payload, id.pub);
+  assert.equal(rep.linkedTo, 29, 'the gap closes and the whole run links');
+  assert.ok(rep.forgotten > 0, 'and only then is there anything safe to forget');
+});
+
 test('store: a random log id has no author and is refused', () => {
   const id = identity();
   const { cert } = encodeBlock(
