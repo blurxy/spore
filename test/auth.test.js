@@ -448,3 +448,50 @@ test('the byte budget is honoured even when the biggest logs are all authority',
 // The types eviction may never drop, mirrored from the substrate so the test states the
 // property rather than importing the implementation's opinion of it.
 const KEEP = new Set([TYPE.COLONY_GENESIS, TYPE.ROLE_GRANT, TYPE.ROLE_REVOKE]);
+
+test('a revocation does not un-link itself by stalling the log it lives in', () => {
+  // The cycle: authority is read from the owner's LINKED blocks, but the owner's link
+  // frontier can depend on a member's, because an owner who replies to a member cites
+  // that member's block as an ordinary dep. So:
+  //
+  //   the revoke links -> M's block stops -> the owner's reply stalls on it as a dep ->
+  //   the revoke is now above the owner's frontier and stops counting -> M's block links
+  //   -> the owner's reply links -> the revoke links -> ...
+  //
+  // It converges identically on every replica, so the convergence property never sees it.
+  // It just converges on the wrong thing: the owner's own log stranded at seq 1, with the
+  // revocation it wrote sitting unlinked above it.
+  const O = identity();
+  const M = identity();
+  const scopeId = colonyIdFor(O.logId, 0);
+  const ow = writer(O, scopeId);
+  const mw = writer(M, scopeId);
+
+  const genesis = ow.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('colony') });
+  const grant = ow.push({ type: TYPE.ROLE_GRANT, payload: encodeGrant({ target: M.logId }) });
+
+  const m0 = mw.push({ payload: Buffer.from('hello'), authRef: grant.hash });
+  const m1 = mw.push({ payload: Buffer.from('again'), authRef: grant.hash });
+  const m2 = mw.push({ payload: Buffer.from('and again'), authRef: grant.hash });
+
+  // The owner replies to M. Nothing exotic — this is what deps are FOR.
+  const reply = ow.push({
+    payload: Buffer.from('noted'),
+    deps: [m1.hash],
+    depLamports: [m1.lamport],
+  });
+  const revoke = ow.push({
+    type: TYPE.ROLE_REVOKE,
+    payload: encodeRevoke({ target: M.logId, pinSeq: 0 }),
+  });
+
+  const s = new Substrate();
+  load(s, [genesis, grant, m0, m1, m2, reply, revoke]);
+
+  assert.equal(s.replica(M.logId.toString('hex')).linkedTo, 0,
+    'M is revoked at pin 0, so only seq 0 survives');
+  assert.equal(s.replica(O.logId.toString('hex')).linkedTo, revoke.seq,
+    "the owner's own log must not be stranded by the revocation it wrote");
+  assert.ok(s.auth.revokes.size > 0, 'and the revocation must still be in force');
+  void m2;
+});

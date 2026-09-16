@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import {
-  encodeBlock, logIdFor, TYPE, FLAG, encodeGrant, encodeRevoke, colonyIdFor,
+  encodeBlock, decodeBlock, logIdFor, TYPE, FLAG, encodeGrant, encodeRevoke, colonyIdFor,
 } from '../src/substrate/block.js';
 import { Substrate } from '../src/substrate/store.js';
 import { Syncer, MAX_INFLIGHT_PER_PEER } from '../src/sharding/sync.js';
@@ -215,6 +215,24 @@ test('property: replicas fed the same blocks in any order reach the same state',
       for (const b of shuffled(rng(seed * 100 + k), world.blocks)) {
         s.insert(b.cert, b.payload, b.authorPub);
       }
+      // LIVENESS, not just agreement. Two replicas that both stall identically agree
+      // perfectly and are both wrong, and `snapshot` cannot tell the difference. A stall
+      // is only legitimate when the dep genuinely cannot be ordered — never when the
+      // substrate is already holding it, ordered, and simply stopped asking. That is what
+      // a fixpoint loop counting only promotions did: a log whose every block was stopped
+      // by a revocation still ORDERED them, reported no progress, and the loop exited
+      // before the log citing them could resolve.
+      for (const rep of s.logs.values()) {
+        if (!rep.pendingDeps) continue;
+        const stuck = rep.blocks.get(rep.orderedTo + 1);
+        if (!stuck) continue; // waiting on a gap in the log itself, which is fine
+        for (const dep of decodeBlock(stuck.cert).deps) {
+          const at = s.resolveDep(dep);
+          assert.ok(!at || !at.ordered,
+            `seed ${seed}, shuffle ${k}: stalled on a dep this substrate has already ordered`);
+        }
+      }
+
       const snap = snapshot(s);
       if (reference === null) reference = snap;
       else assert.equal(snap, reference, `seed ${seed}, shuffle ${k}: replicas diverged`);
@@ -268,15 +286,26 @@ test('property: eviction never lowers the frontier, however tight the budget', (
 
     const s = new Substrate({ maxBytes: each * (2 + Math.floor(r() * 8)) });
     let high = new Map();
+    let retractions = 0;
+    s.on('retracted', () => { retractions++; });
     for (const b of shuffled(rng(seed * 13), world.blocks)) {
+      const seen = retractions;
       s.insert(b.cert, b.payload, b.authorPub);
       for (const [k, rep] of s.logs) {
         const prev = high.get(k) ?? -1;
-        assert.ok(rep.linkedTo >= prev,
-          `seed ${seed}: eviction dropped the frontier ${prev} -> ${rep.linkedTo}`);
+        // A frontier may fall for exactly one reason — history was withdrawn and the
+        // substrate said so. EVICTION is never that reason: forgetting old blocks must
+        // cost old blocks and nothing above them. Before authority existed this test could
+        // assert plain monotonicity; now a revocation coming into reach is a real
+        // retraction, so the exemption is the announcement, not the drop.
+        assert.ok(rep.linkedTo >= prev || retractions > seen,
+          `seed ${seed}: frontier fell ${prev} -> ${rep.linkedTo} with no retraction`);
         high.set(k, rep.linkedTo);
-        // and the frontier block itself must survive, or the log stalls forever
-        if (rep.linkedTo >= 0) {
+        // The frontier block must survive, or the log stalls forever — UNLESS the
+        // frontier has fallen back to the floor boundary itself, which a retraction can
+        // do. There, the block is gone by design and floorHash/floorLamport are what
+        // relink() chains the next one against, so the log is not stalled at all.
+        if (rep.linkedTo >= 0 && rep.linkedTo !== rep.floor - 1) {
           assert.ok(rep.has(rep.linkedTo), `seed ${seed}: evicted the frontier block itself`);
         }
       }

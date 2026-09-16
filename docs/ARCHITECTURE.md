@@ -1076,6 +1076,57 @@ promoted nothing, permanently. The replica now keeps the hash and lamport of the
 forgot at the floor: 40 bytes, and the difference between forgetting old history and forgetting
 everything above it.
 
+**R4d. A replica has three frontiers, not one, because ordering and permission are
+different questions.**
+
+R4 made "who may write what" load-bearing, and reading it from the wrong frontier put a
+cycle in the substrate. Authority was read from `linkedTo`. But an owner who replies to a
+member cites that member's block as an ordinary dep, so `linkedTo` for the owner depends on
+`linkedTo` for the member, which depends on authority, which depends on the owner. Traced:
+the revocation links → the member's block stops → the owner's reply stalls on it as a dep →
+the revocation is now above the owner's own frontier and stops counting → the member's block
+links again. Round and round, four rounds, then a cap.
+
+It converged identically on every replica, so the convergence property never saw it. It
+converged on the wrong thing: **the owner stranded at seq 1, holding an unlinked revocation
+they had written themselves.**
+
+| frontier | what it proves | what needs it |
+|---|---|---|
+| `chainTo` | signature + `prev_hash` continuity | **authority** — who wrote this, and where in their log |
+| `orderedTo` | + lamport derives | **deps** — where a block sits in causal order |
+| `linkedTo` | + authority | **delivery** — what a reader is shown |
+
+Each is strictly weaker than the next, and the split is what breaks the cycle at the root.
+Whether a block was written by this author, and where in their log, is settled by the
+signature and the chain; it never needed to wait on some earlier block of theirs having its
+lamport confirmed against a dep in somebody else's log. And a block written by someone who
+had lost their role still *happened* and still sits at a definite causal position — making
+deps wait on delivery is what stranded the owner.
+
+Consequences, all of them found by falsifying rather than by reasoning:
+
+- **Authority is settled once per resolution, not iterated.** It is a pure function of the
+  blocks held, so the four-round grow-then-rebuild loop is gone. The remaining loop is the
+  genuine one: linking log A can unblock a dep in log B.
+- **The trigger is arrival, not linking** — and specifically "an authority block came into
+  reach", which is not the same question as "a control block arrived". A revocation can sit
+  held-but-unchained above a gap until an *ordinary message* fills it.
+- **Deps carry a lamport witness.** Eviction deletes a block and its hash index together, so
+  a recomputation that re-resolved deps stranded every log that had cited forgotten history.
+  Each block records its deps' lamports when first ordered — `floorLamport` generalised from
+  the one predecessor to all N. It is a **fallback, not a cache**: live evidence always wins,
+  or a dep retracted by a late fork keeps a stale lamport and the answer depends on arrival
+  order again.
+- **Ordering progress counts as progress** in the fixpoint. A log whose every block is
+  stopped by a revocation still *orders* them, and another log's dep resolves against that.
+  Counting only promotions ended the loop early, and which logs had run by then depended on
+  `Map` insertion order.
+
+Not fixed, and not introduced by any of this: **a fork at a seq already evicted can no longer
+be detected**, because detection is a collision at that seq and nothing is left to collide
+with. That is a property of forgetting.
+
 ## Open Decisions
 
 These require a human call; each has options and a recommendation, not a default.

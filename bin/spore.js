@@ -81,8 +81,11 @@ const view = new MyceliumView(tel, { nick: NICK, sporeId: sporeId.toString('hex'
 /**
  * The most recent thing we have seen from somebody else, as a citable dep.
  *
- * Only LINKED blocks qualify. A held-but-unlinked block's lamport has not been validated
- * yet, and citing it would stall our own block at every receiver until it links there too.
+ * Only LINKED blocks qualify. That is stricter than it strictly needs to be — a receiver
+ * derives lamport from a dep's ORDERED position, and a block stopped on authority is still
+ * ordered — but citing something the receiver has not delivered would put a dep in our log
+ * on a block their user never saw. Held-but-unordered is genuinely unusable: its lamport
+ * has not been validated, so citing it stalls our block at every receiver until it is.
  */
 function latestForeignDep() {
   let best = null;

@@ -76,9 +76,11 @@ export const MAX_BYTES = 64 * 1024 * 1024;
  * cannot hand us a log claiming to be someone else's.
  */
 /**
- * Block types eviction may never drop. See LogReplica#forgetOldest.
+ * The control blocks that decide who may write what. Eviction may never drop them
+ * (LogReplica#forgetOldest) and Substrate#rebuildAuth reads exactly these.
  */
-const KEEP_FOREVER = new Set([TYPE.COLONY_GENESIS, TYPE.ROLE_GRANT, TYPE.ROLE_REVOKE]);
+const AUTHORITY = new Set([TYPE.COLONY_GENESIS, TYPE.ROLE_GRANT, TYPE.ROLE_REVOKE]);
+const KEEP_FOREVER = AUTHORITY;
 
 export class LogReplica {
   constructor(logId, authorPub) {
@@ -100,7 +102,20 @@ export class LogReplica {
     this.floorLamport = 0n;
     this.bytes = 0;
     this.forgotten = 0;
-    this.linkedTo = -1; // highest seq reachable by prev_hash from 0
+    this.linkedTo = -1; // highest seq reachable by prev_hash from 0, AND lamport-derived
+    // Highest seq reachable by prev_hash alone. Weaker than linkedTo on purpose, and it
+    // is what AUTHORITY is read from — see Substrate#rebuildAuth. Whether a block was
+    // written by this author, and where in their log, is settled by the signature and the
+    // chain; it does not wait on some earlier block of theirs having its lamport confirmed
+    // against a dep in somebody else's log.
+    this.chainTo = -1;
+    // Highest seq whose prev_hash AND lamport check out, regardless of authority. This is
+    // what a DEP resolves against, because ordering and permission are different
+    // questions: a block written by somebody who had lost their role still happened, still
+    // sits at a definite causal position, and its lamport was derived and checked like any
+    // other. Making deps wait on `linkedTo` meant an owner who replied to a member and
+    // then revoked them stranded their OWN log forever on a dep that could never resolve.
+    this.orderedTo = -1;
     this.pendingDeps = false; // frontier is waiting on a dep in another log
     this.forks = new Map(); // seq -> { kept, other } block hashes
     this.forkedAt = Infinity; // lowest seq the author signed twice; the log ends here
@@ -154,6 +169,37 @@ export class LogReplica {
     return n;
   }
 
+  /**
+   * Advance the chain frontier as far as prev_hash alone allows.
+   *
+   * Same walk relink() does, minus lamport and minus authority — which is the entire
+   * point. Cheap: it only ever moves forward, and only when the block that just landed
+   * closes the gap at chainTo + 1.
+   *
+   * Returns true if the walk brought an AUTHORITY block into reach. That is not the same
+   * question as "is the block that just arrived a control block": a revocation can sit
+   * held-but-unchained above a gap for as long as it takes an ORDINARY message to fill it,
+   * and the moment it does, who may write what changes. Triggering only on control-block
+   * arrival made the outcome depend on whether the gap-filler came before or after the
+   * revocation — which the convergence property caught, on seed 3.
+   */
+  extendChain() {
+    let authority = false;
+    for (let s = this.chainTo + 1; s < this.forkedAt; s++) {
+      const b = this.blocks.get(s);
+      if (!b) break;
+      const prev = s === 0 ? null : (s === this.floor ? this.floorHash : this.hashAt(s - 1));
+      const d = decodeBlock(b.cert);
+      const chained = s === 0
+        ? d.prevHash.every((x) => x === 0)
+        : d.prevHash.equals(prev || Buffer.alloc(0));
+      if (!chained) break;
+      this.chainTo = s;
+      if (AUTHORITY.has(b.type)) authority = true;
+    }
+    return authority;
+  }
+
   /** Grow the held-bitfield so index `seq` is representable. */
   reserve(seq) {
     if (seq + 1 > this.bits.size) this.bits.grow(seq + 1);
@@ -189,8 +235,11 @@ export class LogReplica {
    * reason. See Substrate#authCheck.
    */
   relink(resolve, authOf) {
-    const promoted = [];
-    for (let s = this.linkedTo + 1; s < this.forkedAt; s++) {
+    this.pendingDeps = false;
+
+    // WALK ONE — ORDERING. prev_hash and lamport, nothing else. Monotone: once a block's
+    // position is settled it is settled for good, so this never re-examines anything.
+    for (let s = this.orderedTo + 1; s < this.forkedAt; s++) {
       const b = this.blocks.get(s);
       if (!b) break;
       const d = decodeBlock(b.cert);
@@ -206,22 +255,62 @@ export class LogReplica {
       let m = s === 0 ? 0n
         : (s === this.floor ? this.floorLamport : this.blocks.get(s - 1).lamport);
       let stalled = false;
-      for (const dep of d.deps) {
-        const r = resolve(dep);
-        if (!r || !r.linked) { stalled = true; break; }
-        if (r.lamport > m) m = r.lamport;
+
+      // Resolve each dep live; fall back to the witness ONLY where the evidence is gone.
+      //
+      // The witness exists because eviction deletes a block and its byHash entry together,
+      // so a recompute that insisted on re-resolving would strand every log that had ever
+      // cited forgotten history. Eviction only takes blocks below a frontier, so anything
+      // citing them had already ordered them: the question was asked and answered before
+      // the evidence went, and this is floorLamport generalised from the one predecessor
+      // to all N deps.
+      //
+      // It is a FALLBACK, not a cache, and the difference is a convergence bug. Trusting
+      // it whenever present meant a dep retracted by a late-arriving fork kept the lamport
+      // it had been frozen with, so whether a log linked depended on whether it was
+      // ordered before or after the fork turned up — the exact arrival-order dependence
+      // this substrate exists to avoid. The property harness caught it on seed 5.
+      //
+      // Not fixed and not introduced here: a fork at a seq already evicted can no longer
+      // be DETECTED, because detection is a collision at that seq and nothing is left to
+      // collide with. That is a property of forgetting.
+      const got = [];
+      for (let i = 0; i < d.deps.length; i++) {
+        const dr = resolve(d.deps[i]);
+        if (dr) {
+          if (!dr.ordered) { stalled = true; break; }
+          got.push(dr.lamport);
+        } else if (b.depLamports && i < b.depLamports.length) {
+          got.push(b.depLamports[i]); // forgotten, but we answered this once
+        } else {
+          stalled = true;
+          break;
+        }
       }
+      if (!stalled) {
+        b.depLamports = got;
+        for (const dl of got) if (dl > m) m = dl;
+      }
+
       if (stalled) { this.pendingDeps = true; break; }
-      this.pendingDeps = false;
-
       if (d.lamport !== m + 1n) break; // asserted, not derived. The log ends here.
+      this.orderedTo = s;
+    }
 
+    // WALK TWO — DELIVERY. Authority, over the ordered range only, and re-run from
+    // linkedTo every time: a grant can arrive late, and when it does the run it was
+    // blocking has to promote. An earlier version folded this into the walk above with a
+    // sticky flag, which meant that once authority had stopped a log, nothing ever asked
+    // again and a late grant was silently ignored forever.
+    const promoted = [];
+    for (let s = this.linkedTo + 1; s <= this.orderedTo; s++) {
+      const b = this.blocks.get(s);
+      if (!b) break;
       if (authOf) {
-        const verdict = authOf(this, s, d);
+        const verdict = authOf(this, s, decodeBlock(b.cert));
         if (verdict === 'stall') { this.pendingDeps = true; break; }
-        if (verdict === 'stop') break; // the authority claim fails. The log ends here too.
+        if (verdict === 'stop') break; // the authority claim fails. Delivery ends here.
       }
-
       this.linkedTo = s;
       promoted.push(s);
     }
@@ -251,17 +340,22 @@ export class Substrate extends EventEmitter {
     this.byHash = new Map();
     // Derived authority, rebuilt from the linked set — never accumulated incrementally,
     // because a retraction can withdraw a grant and an accumulator has no way to notice.
-    this.auth = { owners: new Map(), revokes: new Map() };
+    this.auth = { owners: new Map(), grants: new Map(), revokes: new Map() };
   }
 
-  /** What a dep points at, for lamport derivation. null if we do not hold it. */
+  /**
+   * What a dep points at, for lamport derivation. null if we do not hold it.
+   *
+   * `ordered`, not `linked`: a dep asks WHERE a block sits, not whether its author was
+   * allowed to write it. See LogReplica#orderedTo.
+   */
   resolveDep(depHash) {
     const at = this.byHash.get(Buffer.from(depHash).toString('hex'));
     if (!at) return null;
     const r = this.logs.get(at.key);
     const b = r?.get(at.seq);
     if (!b) return null;
-    return { lamport: b.lamport, linked: at.seq <= r.linkedTo, replica: r, seq: at.seq, block: b };
+    return { lamport: b.lamport, ordered: at.seq <= r.orderedTo, replica: r, seq: at.seq, block: b };
   }
 
   /**
@@ -317,18 +411,23 @@ export class Substrate extends EventEmitter {
     const owner = this.auth.owners.get(scope);
     if (!owner) return 'stall'; // we do not know this colony yet; not the author's fault
 
-    const at = this.resolveDep(d.authRef);
-    if (!at || !at.linked) return 'stall'; // the cited grant has not arrived, or not linked
-
-    if (at.block.type !== TYPE.ROLE_GRANT) return 'stop';
-    if (at.replica.key !== owner) return 'stop'; // granted by someone with nothing to give
-    let g;
-    try { g = decodeGrant(at.block.payload); } catch { return 'stop'; }
-    if (g.target.toString('hex') !== replica.key) return 'stop'; // somebody else's grant
+    const ref = Buffer.from(d.authRef).toString('hex');
+    const g = this.auth.grants.get(ref);
+    if (!g) {
+      // Not a grant we recognise. Distinguish "have not got it" from "got it and it is
+      // not one", because the first must wait and the second must not.
+      const at = this.byHash.get(ref);
+      const held = at && this.logs.get(at.key)?.get(at.seq);
+      if (!held) return 'stall';                              // never seen it
+      if (held.type !== TYPE.ROLE_GRANT) return 'stop';       // held, and not a grant
+      return 'stall';                                         // a grant, chain not yet joined
+    }
+    if (g.owner !== owner) return 'stop'; // granted by someone with nothing to give
+    if (g.target !== replica.key) return 'stop'; // somebody else's grant
     // Revocation pins carry a scope, so grants must too, or the two are asymmetric: an
     // owner of two colonies who removes someone from one has not removed them from the
     // other, yet their grant in the first would still authorise writes in the second.
-    if (!at.block.scopeId.equals(d.scopeId)) return 'stop';
+    if (g.scope !== scope) return 'stop';
 
     const pins = this.auth.revokes.get(replica.key);
     if (pins) for (const pin of pins) if (pin.scope === scope && pin.pinSeq < seq) return 'stop';
@@ -345,14 +444,16 @@ export class Substrate extends EventEmitter {
    */
   #rebuildAuth() {
     const owners = new Map();
+    const grants = new Map();
     const pending = [];
     for (const r of this.logs.values()) {
-      // Iterate what is HELD rather than the seq range: eviction keeps control blocks
-      // below the floor, and those are exactly the ones that must not stop counting.
+      // Iterate what is HELD rather than a seq range: eviction keeps control blocks below
+      // the floor, and those are exactly the ones that must not stop counting.
       for (const [seq, b] of r.blocks) {
-        if (b.type !== TYPE.COLONY_GENESIS && b.type !== TYPE.ROLE_REVOKE) continue;
-        // Linked, or kept from below the floor — which was linked before it was forgotten.
-        if (seq > r.linkedTo && seq >= r.floor) continue;
+        if (!AUTHORITY.has(b.type)) continue;
+        // Chain-reachable, or kept from below the floor — which was chained before it was
+        // forgotten. NOT `linkedTo`: see the note above on why that was a cycle.
+        if (seq > r.chainTo && seq >= r.floor) continue;
         if (b.type === TYPE.COLONY_GENESIS) {
           // A colony names its own founder. A genesis whose scope_id is not the derived
           // value is ignored outright — not tiebroken against the real one, because a
@@ -360,7 +461,7 @@ export class Substrate extends EventEmitter {
           if (!colonyIdFor(r.logId, seq).equals(b.scopeId)) continue;
           owners.set(b.scopeId.toString('hex'), { key: r.key, hash: b.hash });
         } else {
-          pending.push({ author: r.key, scope: b.scopeId.toString('hex'), payload: b.payload });
+          pending.push({ author: r.key, seq, block: b, scope: b.scopeId.toString('hex') });
         }
       }
     }
@@ -369,24 +470,23 @@ export class Substrate extends EventEmitter {
     for (const p of pending) {
       const o = owners.get(p.scope);
       if (!o || o.key !== p.author) continue; // not the owner's word, so no power
+      if (p.block.type === TYPE.ROLE_GRANT) {
+        let g;
+        try { g = decodeGrant(p.block.payload); } catch { continue; }
+        grants.set(p.block.hash.toString('hex'), {
+          owner: p.author, target: g.target.toString('hex'), scope: p.scope,
+        });
+        continue;
+      }
       let rv;
-      try { rv = decodeRevoke(p.payload); } catch { continue; }
+      try { rv = decodeRevoke(p.block.payload); } catch { continue; }
       const target = rv.target.toString('hex');
       const list = revokes.get(target) || [];
       list.push({ pinSeq: Number(rv.pinSeq), scope: p.scope });
       revokes.set(target, list);
     }
 
-    this.auth = { owners: new Map([...owners].map(([k, v]) => [k, v.key])), revokes };
-
-    const parts = [];
-    for (const [scope, v] of [...owners].sort()) parts.push(`o:${scope}:${v.key}`);
-    for (const [t, list] of [...revokes].sort()) {
-      for (const pin of list.slice().sort((a, b) => a.pinSeq - b.pinSeq)) {
-        parts.push(`r:${t}:${pin.scope}:${pin.pinSeq}`);
-      }
-    }
-    return parts.join('|');
+    this.auth = { owners: new Map([...owners].map(([k, v]) => [k, v.key])), grants, revokes };
   }
 
   /**
@@ -405,7 +505,9 @@ export class Substrate extends EventEmitter {
     for (;;) {
       let moved = false;
       for (const r of round) {
+        const wasOrdered = r.orderedTo;
         const got = r.relink(resolve, authOf);
+        if (r.orderedTo > wasOrdered) moved = true; // ordering unblocks deps too
         if (!got.length) continue;
         moved = true;
         const prev = out.get(r) || [];
@@ -413,6 +515,10 @@ export class Substrate extends EventEmitter {
       }
       if (!moved) break;
       // Only replicas actually waiting on a dep can have been unblocked by that progress.
+      // `pendingDeps` is sufficient, and the wider filter that was briefly here was not:
+      // ordering stops for exactly four reasons, and three of them (a gap, a broken chain,
+      // a bad lamport) stop it permanently or stop chainTo with it. Only a stalled dep is
+      // waiting on news from elsewhere, and only it sets this flag.
       round = [...this.logs.values()].filter((r) => r.pendingDeps);
       if (!round.length) break;
     }
@@ -520,18 +626,25 @@ export class Substrate extends EventEmitter {
     this.bytes += bytes;
     r.reserve(seq);
     r.bits.set(seq);
+    const reachedAuthority = r.extendChain();
     if (seq > r.head) r.head = seq;
     this.byHash.set(b.blockHash.toString('hex'), { key: r.key, seq });
 
     this.tel?.count('substrate.blocks', 1);
     this.emit('block', { logId: r.logId, seq, from, block: b, payload });
 
-    const moved = this.#relinkAll(r);
+    // An authority block changes who may write what, anywhere — including in logs whose
+    // frontiers are already past the point it governs, which #relinkAll cannot take back.
+    // The trigger is ARRIVAL, not linking: authority is read from the chain now, so a
+    // revocation counts the moment its chain joins, and waiting for it to link is the
+    // cycle described in #resolveFrontiers.
+    if (reachedAuthority) {
+      this.#resolveFrontiers();
+      this.#trim();
+      return { ok: true, seq, linked: this.#linkedSince(r, seq) };
+    }
 
-    // A control block that just linked can change who may write what, anywhere — including
-    // in logs whose frontiers are already past the point it governs. #relinkAll only walks
-    // forward, so it cannot take anything back; this is the same hole the fork cascade had.
-    if (this.#linkedAuthority(moved)) this.#resolveFrontiers();
+    const moved = this.#relinkAll(r);
 
     // 'linked' is announced only for what SURVIVED that, and only after it. Emitting on
     // the way through and retracting in the same call would put a message on screen and
@@ -570,15 +683,15 @@ export class Substrate extends EventEmitter {
    * A restore-from-backup equivocates innocently and is punished the same way. There is no
    * way to distinguish it from malice without a clock, and off-web there is no clock.
    */
-  /** Did this promotion link a block that governs authority? */
-  #linkedAuthority(promoted) {
-    for (const [r, seqs] of promoted) {
-      for (const seq of seqs) {
-        const t = r.blocks.get(seq)?.type;
-        if (t === TYPE.COLONY_GENESIS || t === TYPE.ROLE_REVOKE) return true;
-      }
-    }
-    return false;
+  /**
+   * Which of this replica's blocks are linked at or above `from`, after a full resolution.
+   * A full resolution has no notion of "newly" promoted — it recomputes everything — so
+   * this reports what the caller can actually rely on being readable now.
+   */
+  #linkedSince(r, from) {
+    const out = [];
+    for (let s = from; s <= r.linkedTo; s++) if (r.blocks.has(s)) out.push(s);
+    return out;
   }
 
   /**
@@ -609,36 +722,53 @@ export class Substrate extends EventEmitter {
     const before = new Map();
     for (const r of this.logs.values()) before.set(r, r.linkedTo);
 
+    // Authority first, and ONCE. It is a pure function of the blocks held — chains and
+    // signatures, nothing that waits on a lamport — so there is nothing to iterate.
+    //
+    // This used to be a four-round fixed point over grow-then-rebuild, and that loop was
+    // hiding a genuine cycle rather than resolving it. Authority was read from LINKED
+    // blocks, and an owner who replies to a member cites that member's block as an
+    // ordinary dep, so: the revocation links, the member's block stops, the owner's reply
+    // stalls on it, the revocation is now above the owner's own frontier and stops
+    // counting, the member's block links again. Round and round. It converged identically
+    // on every replica, so the convergence property never saw it — it just converged on
+    // the wrong thing, with the owner stranded at seq 1 holding an unlinked revocation
+    // they had written themselves.
+    //
+    // Reading the CHAIN instead breaks the cycle at the root. Whether a block was written
+    // by this author, and where in their log, is settled by the signature and prev_hash.
+    // It has nothing to do with whether an earlier block of theirs has had its lamport
+    // confirmed against somebody else's log, and it never should have waited on one.
+    this.#rebuildAuth();
+
     const resolve = (h) => this.resolveDep(h);
     const authOf = (r, seq, d) => this.#authCheck(r, seq, d);
-    const grow = () => {
-      for (const r of this.logs.values()) {
-        r.linkedTo = r.floor - 1;
-        r.pendingDeps = false;
-      }
-      for (;;) {
-        let moved = false;
-        for (const r of this.logs.values()) if (r.relink(resolve, authOf).length) moved = true;
-        if (!moved) break;
-      }
-    };
-
-    // Growing the frontiers can link a COLONY_GENESIS or a ROLE_REVOKE, which changes the
-    // authority that governs the growth — so it is a fixed point, not a single pass. Two
-    // rounds always suffice under owner-only authority (see #authCheck on
-    // well-foundedness): the owner's log is never stopped, so it grows to the same place
-    // every round and the derived authority is settled after the first. The cap is a
-    // guard against that argument being quietly invalidated by a later change, not a
-    // number tuned to make some case pass; if it ever fires, the assumption broke.
-    let sig = '';
-    let round = 0;
-    for (; round < 4; round++) {
-      grow();
-      const next = this.#rebuildAuth();
-      if (next === sig) break;
-      sig = next;
+    for (const r of this.logs.values()) {
+      r.linkedTo = r.floor - 1;
+      r.orderedTo = r.floor - 1;
+      r.pendingDeps = false;
     }
-    if (round >= 4) this.tel?.count('substrate.auth_unsettled');
+    // The remaining loop is the real one: linking log A can unblock a dep in log B.
+    // It is bounded by progress — each round promotes at least one block or is the last.
+    for (;;) {
+      let moved = false;
+      for (const r of this.logs.values()) {
+        // Ordering progress counts as progress. Linking is not the only thing that can
+        // unblock another log: a log whose every block is stopped by a revocation still
+        // ORDERS them, and another log's dep resolves against orderedTo. Counting only
+        // promotions ended the loop early, and which logs had already run when it ended
+        // depended on Map insertion order — so the answer depended on arrival order.
+        //
+        // The identical fix in #relinkAll is what the property harness actually caught, on
+        // seed 33. No seed currently reaches this copy of the bug, because a full
+        // resolution resets every frontier and the first round usually orders everything.
+        // It is here because it is the same bug in the sibling loop, not because a test
+        // demanded it — said plainly rather than left to look load-bearing.
+        const wasOrdered = r.orderedTo;
+        if (r.relink(resolve, authOf).length || r.orderedTo > wasOrdered) moved = true;
+      }
+      if (!moved) break;
+    }
 
     for (const [r, was] of before) {
       if (r.linkedTo >= was) continue;
@@ -656,7 +786,14 @@ export class Substrate extends EventEmitter {
       r.forks.set(seq, { a: keptHash, b: otherHash, certA: Buffer.from(certA), certB: Buffer.from(certB) });
     }
     const lowered = seq < r.forkedAt;
-    if (lowered) r.forkedAt = seq;
+    if (lowered) {
+      r.forkedAt = seq;
+      // The chain ends at the contradiction as surely as the link does, and authority is
+      // read from the chain — so an equivocating owner's control blocks above the fork
+      // stop counting, which is the point of stopping the log there at all.
+      if (r.chainTo >= seq) r.chainTo = seq - 1;
+      if (r.orderedTo >= seq) r.orderedTo = seq - 1;
+    }
 
     this.tel?.count('substrate.equivocation');
     const f = r.forks.get(seq);
