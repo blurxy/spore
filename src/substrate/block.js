@@ -25,6 +25,12 @@ export const TYPE = {
   COLONY_GENESIS: 0x10,
   FRUITING_CREATE: 0x11,
   MEMBER_JOIN: 0x20,
+  MEMBER_LEAVE: 0x21,
+  MEMBER_INVITE: 0x22,
+  MEMBER_BAN: 0x23,
+  ROLE_GRANT: 0x24,
+  ROLE_REVOKE: 0x25,
+  POWER_SET: 0x26,
   AUTH_SNAPSHOT: 0x30,
   MESSAGE: 0x40,
   EDIT: 0x41,
@@ -42,6 +48,63 @@ export const FLAG = {
 
 const ZERO16 = Buffer.alloc(16);
 const ZERO32 = Buffer.alloc(32);
+
+/**
+ * ROLE_GRANT / ROLE_REVOKE payloads.
+ *
+ * design-app.md gives the op as ROLE_GRANT/REVOKE(member, role_id). REVOKE carries one
+ * field beyond that — `pin_seq`, the revoker's view of the target log's head — and the
+ * reason it is a SEQ and not a lamport is the whole of §1.19's fix.
+ *
+ * The attack (CORRECTNESS.md V1) is a moderator who was demoted while offline and comes
+ * back citing the grant they used to hold, with "a naturally low lamport" — their counter
+ * is anchored to their own frozen head, so their new block sorts BEFORE the revoke in
+ * (lamport, log_id, seq) and gets auth-checked against history from before the demotion.
+ * Every compliant spore computes the identical wrong answer.
+ *
+ * So anything that compares the two blocks' lamports is already lost: the attacker picks
+ * theirs, and picks it low. A seq pin does not care. The target's log is single-writer and
+ * its seqs are monotone, so EVERY block the target writes after the revoker saw them is at
+ * a seq above the pin, no matter what lamport it claims. Writing below the pin is not an
+ * evasion, it is an equivocation, and the log already ends at a fork.
+ *
+ * The cost, stated plainly rather than fixed: if the revoker's pin lags the target's real
+ * head, blocks the target wrote in between are stopped too. The revoker is saying "out, as
+ * of what I had seen," and that is deterministic over-revocation, identical on every spore.
+ */
+export const GRANT_LEN = 20;
+export const REVOKE_LEN = 28;
+
+export function encodeGrant({ target, roleId = 0 }) {
+  if (target.length !== 16) throw new Error(`target must be 16 bytes, got ${target.length}`);
+  const p = Buffer.alloc(GRANT_LEN);
+  target.copy(p, 0);
+  p.writeUInt32LE(roleId, 16);
+  return p;
+}
+
+export function decodeGrant(payload) {
+  if (payload.length !== GRANT_LEN) throw new Error(`grant payload ${payload.length}, want ${GRANT_LEN}`);
+  return { target: payload.subarray(0, 16), roleId: payload.readUInt32LE(16) };
+}
+
+export function encodeRevoke({ target, pinSeq, roleId = 0 }) {
+  if (target.length !== 16) throw new Error(`target must be 16 bytes, got ${target.length}`);
+  const p = Buffer.alloc(REVOKE_LEN);
+  target.copy(p, 0);
+  p.writeBigUInt64LE(BigInt(pinSeq), 16);
+  p.writeUInt32LE(roleId, 24);
+  return p;
+}
+
+export function decodeRevoke(payload) {
+  if (payload.length !== REVOKE_LEN) throw new Error(`revoke payload ${payload.length}, want ${REVOKE_LEN}`);
+  return {
+    target: payload.subarray(0, 16),
+    pinSeq: payload.readBigUInt64LE(16),
+    roleId: payload.readUInt32LE(24),
+  };
+}
 
 /**
  * Encode a block certificate. Returns { cert, blockHash, payloadHash }.

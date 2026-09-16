@@ -28,7 +28,10 @@
 
 import { EventEmitter } from 'node:events';
 import { createPublicKey } from 'node:crypto';
-import { verifyBlock, decodeBlock, logIdMatches, hash256, HEADER_LEN, SIG_LEN } from './block.js';
+import {
+  verifyBlock, decodeBlock, logIdMatches, hash256, HEADER_LEN, SIG_LEN,
+  TYPE, decodeGrant, decodeRevoke,
+} from './block.js';
 import { Bitfield } from '../sharding/scheduler.js';
 
 export const CERT_MIN = HEADER_LEN + SIG_LEN;
@@ -155,8 +158,12 @@ export class LogReplica {
    *
    * `resolve(depHash)` returns { lamport, linked } for a block in ANY log, or null.
    * A LogReplica cannot see other replicas, so the Substrate supplies it.
+   *
+   * `authOf(replica, seq, decoded)` judges the block's auth_ref claim and returns
+   * 'ok' | 'stall' | 'stop' — the same two-outcome discipline a third time, for the same
+   * reason. See Substrate#authCheck.
    */
-  relink(resolve) {
+  relink(resolve, authOf) {
     const promoted = [];
     for (let s = this.linkedTo + 1; s < this.forkedAt; s++) {
       const b = this.blocks.get(s);
@@ -179,6 +186,12 @@ export class LogReplica {
       this.pendingDeps = false;
 
       if (d.lamport !== m + 1n) break; // asserted, not derived. The log ends here.
+
+      if (authOf) {
+        const verdict = authOf(this, s, d);
+        if (verdict === 'stall') { this.pendingDeps = true; break; }
+        if (verdict === 'stop') break; // the authority claim fails. The log ends here too.
+      }
 
       this.linkedTo = s;
       promoted.push(s);
@@ -207,6 +220,9 @@ export class Substrate extends EventEmitter {
     // so validating a dep's lamport needs a substrate-wide index; a replica only sees
     // itself.
     this.byHash = new Map();
+    // Derived authority, rebuilt from the linked set — never accumulated incrementally,
+    // because a retraction can withdraw a grant and an accumulator has no way to notice.
+    this.auth = { owners: new Map(), revokes: new Map() };
   }
 
   /** What a dep points at, for lamport derivation. null if we do not hold it. */
@@ -216,7 +232,127 @@ export class Substrate extends EventEmitter {
     const r = this.logs.get(at.key);
     const b = r?.get(at.seq);
     if (!b) return null;
-    return { lamport: b.lamport, linked: at.seq <= r.linkedTo };
+    return { lamport: b.lamport, linked: at.seq <= r.linkedTo, replica: r, seq: at.seq, block: b };
+  }
+
+  /**
+   * Is this block's `auth_ref` claim good? 'ok' | 'stall' | 'stop'.
+   *
+   * CORRECTNESS.md [FATAL-V1]: a moderator demoted while offline reconnects and publishes
+   * a block citing the grant they used to hold, "with a naturally low lamport". Their
+   * counter is frozen at their own head, so the block sorts BEFORE the revocation and gets
+   * auth-checked against history from before the demotion — and every compliant spore
+   * computes the same wrong answer, which is what makes it fatal rather than annoying.
+   *
+   * That rules out every fix which asks a question the author gets to answer:
+   *   - compare the two lamports: the author picks theirs, and picks it low;
+   *   - ask whether the revocation is causally before the block: the author picks the deps
+   *     and simply does not cite it;
+   *   - require auth_ref to descend from the most recent snapshot in the author's own
+   *     causal cut: true of the stale grant, because the cut is the author's too.
+   *
+   * ARCHITECTURE.md 1.19 also proposes rejecting a block whose auth_ref/lamport gap from
+   * "the current resolved frontier" exceeds a threshold. That one is NOT implemented, and
+   * should not be: the current frontier is receiver-local and time-varying, so two honest
+   * spores holding identical blocks would reject differently and never reconcile. It is
+   * the arrival-order bug wearing a different hat.
+   *
+   * What an author does not control is their own seq. The log is single-writer and
+   * append-only, so a revocation pinning the target at seq k condemns every block the
+   * target writes above k, whatever lamport it claims. Writing at or below k instead is
+   * not an escape: it is an equivocation, and the log already ends at a fork.
+   *
+   * There is deliberately NO rule that the grant's lamport must fall below the block's.
+   * It reads as an obvious sanity check and it is not one: lamport only advances through
+   * cited deps, and a block claiming under a grant does not have to cite it, so an honest
+   * member whose counter is behind the owner's writes perfectly good blocks that sit
+   * "before" their own grant. The rule was written, and it stopped every legitimate block
+   * in the tests below. It also bought nothing — an attacker can cite the grant as a dep
+   * and satisfy it for free, since the grant is old and its lamport is low. Position in
+   * time is not what authorises; the absence of a pin is.
+   *
+   * Well-foundedness: only the colony owner's revocations count, and the owner is never
+   * revoked, so the owner's frontier can never be stopped here. The set of valid
+   * revocations therefore cannot shrink while frontiers are recomputed, and
+   * #resolveFrontiers reaches a fixed point instead of oscillating. Delegated
+   * grant-of-grant is deliberately SP2 for exactly that reason: with delegation a
+   * counter-revocation can un-stop a log, which can link a revocation, which stops
+   * another, and the set is no longer monotone.
+   */
+  #authCheck(replica, seq, d) {
+    if (d.authRef.every((x) => x === 0)) return 'ok'; // claims nothing, needs nothing
+
+    // Who owns the colony this block is written in? Derived from the linked
+    // COLONY_GENESIS, so a retraction that withdraws one takes the ownership with it.
+    const scope = d.scopeId.toString('hex');
+    const owner = this.auth.owners.get(scope);
+    if (!owner) return 'stall'; // we do not know this colony yet; not the author's fault
+
+    const at = this.resolveDep(d.authRef);
+    if (!at || !at.linked) return 'stall'; // the cited grant has not arrived, or not linked
+
+    if (at.block.type !== TYPE.ROLE_GRANT) return 'stop';
+    if (at.replica.key !== owner) return 'stop'; // granted by someone with nothing to give
+    let g;
+    try { g = decodeGrant(at.block.payload); } catch { return 'stop'; }
+    if (g.target.toString('hex') !== replica.key) return 'stop'; // somebody else's grant
+
+    const pins = this.auth.revokes.get(replica.key);
+    if (pins) for (const pin of pins) if (pin.scope === scope && pin.pinSeq < seq) return 'stop';
+    return 'ok';
+  }
+
+  /**
+   * Rebuild owners and revocations from the linked set. Returns a signature of the result
+   * so #resolveFrontiers can tell whether another pass could change anything.
+   *
+   * Only LINKED blocks count. An unlinked revocation has not proven it is the owner's, and
+   * honouring it would mean trusting exactly the chain we have not verified yet — the same
+   * mistake as reading an unlinked dep's lamport.
+   */
+  #rebuildAuth() {
+    const owners = new Map();
+    const pending = [];
+    for (const r of this.logs.values()) {
+      for (let s = r.floor; s <= r.linkedTo; s++) {
+        const b = r.blocks.get(s);
+        if (!b) continue;
+        if (b.type !== TYPE.COLONY_GENESIS && b.type !== TYPE.ROLE_REVOKE) continue;
+        const d = decodeBlock(b.cert);
+        const scope = d.scopeId.toString('hex');
+        if (b.type === TYPE.COLONY_GENESIS) {
+          // Two genesis blocks for one scope is a malformed colony, not something to
+          // arbitrate. Lowest block hash wins, so every spore picks the same one.
+          const cur = owners.get(scope);
+          if (!cur || Buffer.compare(b.hash, cur.hash) < 0) owners.set(scope, { key: r.key, hash: b.hash });
+        } else {
+          pending.push({ author: r.key, scope, payload: b.payload });
+        }
+      }
+    }
+
+    const revokes = new Map();
+    for (const p of pending) {
+      const o = owners.get(p.scope);
+      if (!o || o.key !== p.author) continue; // not the owner's word, so no power
+      let rv;
+      try { rv = decodeRevoke(p.payload); } catch { continue; }
+      const target = rv.target.toString('hex');
+      const list = revokes.get(target) || [];
+      list.push({ pinSeq: Number(rv.pinSeq), scope: p.scope });
+      revokes.set(target, list);
+    }
+
+    this.auth = { owners: new Map([...owners].map(([k, v]) => [k, v.key])), revokes };
+
+    const parts = [];
+    for (const [scope, v] of [...owners].sort()) parts.push(`o:${scope}:${v.key}`);
+    for (const [t, list] of [...revokes].sort()) {
+      for (const pin of list.slice().sort((a, b) => a.pinSeq - b.pinSeq)) {
+        parts.push(`r:${t}:${pin.scope}:${pin.pinSeq}`);
+      }
+    }
+    return parts.join('|');
   }
 
   /**
@@ -229,12 +365,13 @@ export class Substrate extends EventEmitter {
    */
   #relinkAll(seed) {
     const resolve = (h) => this.resolveDep(h);
+    const authOf = (r, seq, d) => this.#authCheck(r, seq, d);
     const out = new Map();
     let round = [seed];
     for (;;) {
       let moved = false;
       for (const r of round) {
-        const got = r.relink(resolve);
+        const got = r.relink(resolve, authOf);
         if (!got.length) continue;
         moved = true;
         const prev = out.get(r) || [];
@@ -246,7 +383,7 @@ export class Substrate extends EventEmitter {
       if (!round.length) break;
     }
     for (const [r, seqs] of out) this.emit('linked', { logId: r.logId, seqs });
-    return out.get(seed) || [];
+    return out;
   }
 
   get size() {
@@ -355,7 +492,18 @@ export class Substrate extends EventEmitter {
     this.tel?.count('substrate.blocks', 1);
     this.emit('block', { logId: r.logId, seq, from, block: b, payload });
 
-    const promoted = this.#relinkAll(r);
+    const moved = this.#relinkAll(r);
+    let promoted = moved.get(r) || [];
+
+    // A control block that just linked can change who may write what, anywhere — including
+    // in logs whose frontiers are already past the point it governs. #relinkAll only walks
+    // forward, so it cannot take anything back; this is the same hole the fork cascade had.
+    if (this.#linkedAuthority(moved)) {
+      this.#resolveFrontiers();
+      // Report only what actually survived the recomputation. Telling a caller a block
+      // linked and then retracting it in the same call is worse than never saying so.
+      promoted = promoted.filter((x) => x <= r.linkedTo);
+    }
     this.#trim();
     return { ok: true, seq, linked: promoted };
   }
@@ -385,8 +533,19 @@ export class Substrate extends EventEmitter {
    * A restore-from-backup equivocates innocently and is punished the same way. There is no
    * way to distinguish it from malice without a clock, and off-web there is no clock.
    */
+  /** Did this promotion link a block that governs authority? */
+  #linkedAuthority(promoted) {
+    for (const [r, seqs] of promoted) {
+      for (const seq of seqs) {
+        const t = r.blocks.get(seq)?.type;
+        if (t === TYPE.COLONY_GENESIS || t === TYPE.ROLE_REVOKE) return true;
+      }
+    }
+    return false;
+  }
+
   /**
-   * Recompute every frontier from the bottom.
+   * Recompute every frontier from the bottom, to a fixed point.
    *
    * A retraction does not stop at the log that forked. Another log may have linked a
    * block whose dep pointed above the new fork point — it was linked on the strength of
@@ -404,20 +563,46 @@ export class Substrate extends EventEmitter {
    * Frontiers reset to `floor - 1` rather than -1, because everything below floor has been
    * evicted. Those blocks were verified when they arrived and cannot be rechecked now;
    * re-deriving them is neither possible nor necessary.
+   *
+   * A withdrawn ROLE_REVOKE is the second thing that can cascade this way, and it arrives
+   * by the opposite route: the revocation LINKS, and blocks that were linked above its pin
+   * have to come back out. Same machinery, same event.
    */
-  #recomputeAll() {
+  #resolveFrontiers() {
     const before = new Map();
-    for (const r of this.logs.values()) {
-      before.set(r, r.linkedTo);
-      r.linkedTo = r.floor - 1;
-      r.pendingDeps = false;
-    }
+    for (const r of this.logs.values()) before.set(r, r.linkedTo);
+
     const resolve = (h) => this.resolveDep(h);
-    for (;;) {
-      let moved = false;
-      for (const r of this.logs.values()) if (r.relink(resolve).length) moved = true;
-      if (!moved) break;
+    const authOf = (r, seq, d) => this.#authCheck(r, seq, d);
+    const grow = () => {
+      for (const r of this.logs.values()) {
+        r.linkedTo = r.floor - 1;
+        r.pendingDeps = false;
+      }
+      for (;;) {
+        let moved = false;
+        for (const r of this.logs.values()) if (r.relink(resolve, authOf).length) moved = true;
+        if (!moved) break;
+      }
+    };
+
+    // Growing the frontiers can link a COLONY_GENESIS or a ROLE_REVOKE, which changes the
+    // authority that governs the growth — so it is a fixed point, not a single pass. Two
+    // rounds always suffice under owner-only authority (see #authCheck on
+    // well-foundedness): the owner's log is never stopped, so it grows to the same place
+    // every round and the derived authority is settled after the first. The cap is a
+    // guard against that argument being quietly invalidated by a later change, not a
+    // number tuned to make some case pass; if it ever fires, the assumption broke.
+    let sig = '';
+    let round = 0;
+    for (; round < 4; round++) {
+      grow();
+      const next = this.#rebuildAuth();
+      if (next === sig) break;
+      sig = next;
     }
+    if (round >= 4) this.tel?.count('substrate.auth_unsettled');
+
     for (const [r, was] of before) {
       if (r.linkedTo >= was) continue;
       const seqs = [];
@@ -442,7 +627,7 @@ export class Substrate extends EventEmitter {
 
     // Every frontier, not just this log's. A fork withdraws history other logs may have
     // linked against, and that can cascade further. #recomputeAll emits the retractions.
-    if (lowered) this.#recomputeAll();
+    if (lowered) this.#resolveFrontiers();
     return lowered;
   }
 
