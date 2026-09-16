@@ -27,6 +27,26 @@ import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { MAX_WRITE_BUFFER } from '../transport/tcp.js';
 
+/** The port `--glass` opens on when no number follows it. docs/TERMUX.md step 5 says this. */
+export const GLASS_PORT = 7777;
+
+/**
+ * What port a `--glass` argument means.
+ *
+ * Lives here, exported and tested, because the version inlined in bin/spore.js was wrong for
+ * the one case everybody hits. The arg parser returns boolean `true` for a flag with no
+ * value, `Number(true)` is 1, and `1 || 7777` short-circuits to 1 — so a bare `--glass`
+ * bound port 1 while the runbook told people to open 7777. bin/spore.js has no tests, and
+ * every test in test/glass.test.js passes `port: 0` explicitly, so nothing ever evaluated
+ * the default. A one-line expression in an untested entry point is exactly where this hides.
+ */
+export function resolveGlassPort(arg) {
+  if (arg === true || arg === undefined || arg === null || arg === '') return GLASS_PORT;
+  const n = Number(arg);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return GLASS_PORT;
+  return n;
+}
+
 export const MAX_CLIENTS = 4;
 export const KEEPALIVE_MS = 15_000;
 

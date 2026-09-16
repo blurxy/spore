@@ -9,7 +9,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect } from 'node:net';
 import { Telemetry } from '../src/telemetry/bus.js';
-import { Glass, isLoopback, MAX_CLIENTS, MODULE_ROUTES } from '../src/ui/glass.js';
+import {
+  Glass, isLoopback, MAX_CLIENTS, MODULE_ROUTES, resolveGlassPort, GLASS_PORT,
+} from '../src/ui/glass.js';
 
 async function glass(opts = {}) {
   const tel = new Telemetry();
@@ -208,4 +210,30 @@ test('glass: the page carries no control surface', async () => {
   assert.equal(post.status, 200);
   assert.equal(await post.text(), page, 'a POST gets the page, because nothing writes');
   await g.stop();
+});
+
+test('glass: a bare --glass opens the port the runbook tells people to open', () => {
+  // Found by running the thing and looking at it, which no test in this file did. Every
+  // test here passes `port: 0` to get an ephemeral port, so the default was never once
+  // evaluated — and bin/spore.js, where the default lived, has no tests at all.
+  //
+  // The bug: the arg parser returns boolean `true` for a flag with no value, `Number(true)`
+  // is 1, and `1 || 7777` short-circuits to 1. So `node bin/spore.js --glass` served on
+  // port 1 while docs/TERMUX.md step 5 told people to open 127.0.0.1:7777. That is step one
+  // of the first thing anyone does on a phone, and it would have looked like the mesh was
+  // broken rather than like a flag-parsing slip.
+  assert.equal(resolveGlassPort(true), GLASS_PORT, 'a valueless --glass is the default, not 1');
+  assert.equal(resolveGlassPort(undefined), GLASS_PORT);
+  assert.equal(resolveGlassPort(''), GLASS_PORT);
+
+  // An explicit port still wins.
+  assert.equal(resolveGlassPort('9090'), 9090);
+  assert.equal(resolveGlassPort(9090), 9090);
+
+  // Nonsense falls back rather than binding something surprising. Port 0 is excluded on
+  // purpose: to the OS it means "any free port", which is right for a test and wrong for a
+  // runbook that prints an address the user is meant to type.
+  for (const junk of ['--nick', 'banana', '0', '-1', '70000', '80.5', NaN]) {
+    assert.equal(resolveGlassPort(junk), GLASS_PORT, `${junk} should fall back`);
+  }
 });

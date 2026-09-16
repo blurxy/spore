@@ -20,7 +20,7 @@ import { Syncer } from '../src/sharding/sync.js';
 import { blockFits } from '../src/sharding/wire.js';
 import { Screen } from '../src/ui/canvas.js';
 import { MyceliumView, PAL } from '../src/ui/mycelium.js';
-import { Glass } from '../src/ui/glass.js';
+import { Glass, resolveGlassPort } from '../src/ui/glass.js';
 
 const argv = process.argv.slice(2);
 const flag = (n, d = null) => {
@@ -35,7 +35,7 @@ const HEADLESS = has('headless') || !process.stdout.isTTY;
 // --glass opens the same view in a browser on this device, for the hardware the mesh is
 // actually for. Off unless asked: it is a second surface, and a surface that is not
 // running cannot be got at. Loopback only, read-only — see src/ui/glass.js.
-const GLASS = has('glass') ? Number(flag('glass', 7777)) || 7777 : 0;
+const GLASS = has('glass') ? resolveGlassPort(flag('glass')) : 0;
 
 // The network key scopes a mesh. Everyone who shares it can find each other; it is not
 // a secret and provides no confidentiality — it is a cheap pre-signature junk filter.
