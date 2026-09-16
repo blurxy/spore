@@ -753,6 +753,25 @@ export class Substrate extends EventEmitter {
       return { ok: false, reason: 'equivocation', seq };
     }
 
+    // BELOW THE FLOOR IS DECIDED, NOT UNKNOWN. The fork check above asks r.blocks for this
+    // seq, and for one we EVICTED that answers undefined — indistinguishable from a seq we
+    // never saw. So a replay was admitted as brand new, and since forgetOldest only iterates
+    // [floor, linkedTo), it could never be evicted again: the byte budget leaked, one block
+    // per replay, until nothing evictable was left.
+    //
+    // The worse half is that nothing below the floor is ever re-walked, so the signed lamport
+    // is taken on trust and resolveDep reports ordered:true for it (orderedTo >= floor - 1
+    // always holds). With `prior` undefined a DIFFERENT block at that seq is not flagged as
+    // equivocation either — so any identity could plant an arbitrary lamport at any seq this
+    // replica had forgotten, and advertise() publishes the cleared HAVE bit that says which.
+    //
+    // This must come AFTER the duplicate/fork check above: a KEEP_FOREVER block retained
+    // below the floor is still held, and re-offering it is an ordinary duplicate.
+    if (seq < r.floor) {
+      this.tel?.count('substrate.reject.below_floor');
+      return { ok: false, reason: 'below_floor', seq };
+    }
+
     const bytes = cert.length + payload.length;
     r.blocks.set(seq, {
       cert: Buffer.from(cert),

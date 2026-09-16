@@ -912,3 +912,59 @@ test('sync: a peer that withers mid-transfer strands nothing', async () => {
   stable.sync.stop(); joiner.sync.stop();
   await stable.mgr.stop(); await joiner.mgr.stop();
 });
+
+test('store: a block below the eviction floor is refused, not silently re-admitted', () => {
+  // The byte-budget leak is the small half of this. insert() looks for a fork with
+  // `prior = r.blocks.get(seq)`, and for a seq that was EVICTED that returns undefined —
+  // indistinguishable from a seq never seen. So a replayed block is admitted as brand new:
+  // bytes counted, HAVE bit set, and forgetOldest iterates [floor, linkedTo) so it can
+  // never be evicted again.
+  //
+  // The large half is that nothing below the floor is ever re-walked, so the lamport the
+  // author signed is taken on trust, and `resolveDep` reports `ordered: true` for it
+  // because orderedTo >= floor - 1 always holds. And since `prior` is undefined, a
+  // DIFFERENT block at that seq is not detected as equivocation either. So any identity
+  // can plant an arbitrary lamport at any seq the victim has forgotten — and advertise()
+  // publishes the cleared HAVE bit, which tells them exactly which seqs qualify.
+  //
+  // Deliberately plain eviction: no revocation, so this never touches the floor clamp from
+  // ARCHITECTURE.md R7. That clamp is under review and a test that depended on it would be
+  // measuring the wrong thing.
+  const id = identity();
+  const blocks = chain(id, 12);
+
+  const width = blocks[0].cert.length + 8;
+  const s = new Substrate({ maxBytes: width * 4 });
+  for (const b of blocks) s.insert(b.cert, b.payload, id.pub);
+
+  const r = s.replica(id.logId.toString('hex'));
+  assert.ok(r.floor > 0, `the budget must actually have bitten (floor ${r.floor})`);
+  assert.ok(!r.blocks.has(0), 'seq 0 was forgotten');
+  const bytesBefore = s.bytes;
+  const linkedBefore = r.linkedTo;
+
+  // 1. An honest replay of a block we deliberately forgot.
+  const replay = s.insert(blocks[0].cert, blocks[0].payload, id.pub);
+  assert.equal(replay.ok, false, 'a block below the floor must not be re-admitted');
+  assert.equal(s.bytes, bytesBefore, 'and must not be counted against the budget');
+  assert.ok(!r.blocks.has(0), 'and must not be held again');
+
+  // 2. The same seq, a different block, an invented lamport. This is the attack: it is not
+  //    a duplicate, it is not detected as a fork, and nothing would ever re-derive it.
+  const { cert: forged } = encodeBlock(
+    {
+      type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE,
+      logId: id.logId, seq: 0, lamport: 999_999, prevHash: Buffer.alloc(32),
+      payload: Buffer.from('forged'),
+    },
+    id.kp.privateKey,
+  );
+  const inject = s.insert(forged, Buffer.from('forged'), id.pub);
+  assert.equal(inject.ok, false, 'a forged lamport below the floor must not be accepted');
+  assert.equal(s.bytes, bytesBefore, 'and must cost nothing');
+  assert.equal(r.linkedTo, linkedBefore, 'and must not move the frontier');
+
+  // 3. The budget still holds, which is what test "the byte budget is honoured" asserts and
+  //    what the leak defeated: every replay used to add bytes with nothing left to evict.
+  assert.ok(s.bytes <= s.maxBytes, `over budget: ${s.bytes} > ${s.maxBytes}`);
+});
