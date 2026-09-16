@@ -70,6 +70,8 @@ class Filament {
 }
 
 export class MyceliumView {
+  #lastLive = 0;
+
   constructor(telemetry, { nick = 'spore', sporeId = '' } = {}) {
     this.tel = telemetry;
     this.nick = nick;
@@ -81,6 +83,10 @@ export class MyceliumView {
     this.announces = 0;
     this.nextAngle = -Math.PI / 2;
     this.encrypted = false; // SP1 truth. Do not flip this until the ciphertext is real.
+    this.lamport = 0;
+    this.bloom = 0;          // decays after a real capacity jump
+    this.bloomCount = 0;
+    this.#lastLive = 0;
     this.#wire();
   }
 
@@ -173,6 +179,17 @@ export class MyceliumView {
       if (f.dead) this.filaments.delete(k);
     }
     for (const m of this.messages) m.age.step(dt);
+
+    // BLOOM: fire only on a REAL increase in fused hyphae, then decay. No timer drives
+    // this — if capacity did not actually jump, nothing blooms.
+    const live = [...this.filaments.values()].filter((f) => f.state === 'fused').length;
+    if (live > this.#lastLive) {
+      this.bloomCount = live - this.#lastLive;
+      this.bloom = 1;
+    }
+    this.#lastLive = live;
+    this.bloom = Math.max(0, this.bloom - dt * 0.5);
+
     return dt;
   }
 
@@ -254,11 +271,36 @@ export class MyceliumView {
       cv.write(px, i + 3, shown.slice(0, width), m.colour);
     });
 
-    // ---- header
-    cv.write(1, 0, '░▒▓ MYCELIUM ▓▒░', PAL.core);
+    // ---- header and the state pulse
+    //
+    // The pulse is the machinery on the page. Its REGISTER shifts with what the mesh is
+    // actually doing — a lone spore reads differently from a fused one, and a BLOOM reads
+    // differently again — but every value in it is measured, never decorative.
+    cv.write(1, 0, '░▒▓ MYC3L1UM ▓▒░', PAL.core);
     const stat = `${live} fused · ${this.filaments.size} known · ${this.announces} shouts`;
     cv.write(cv.w - stat.length - 1, 0, stat, PAL.dim);
-    cv.write(1, 1, `spore ${this.sporeId.slice(0, 16)}  ${this.nick}`, PAL.dim);
+
+    let pulse;
+    let pulseColour;
+    if (this.bloom > 0.02) {
+      pulse = `BL00M · +${this.bloomCount} · c4p ×${(1 + live).toFixed(1)}`;
+      pulseColour = mix(PAL.tip, PAL.seed, this.bloom);
+    } else if (live > 0) {
+      const sas = [...this.filaments.values()].find((f) => f.sas)?.sas;
+      pulse = `L=${this.lamport} · ${live} hypha${live === 1 ? '' : 'e'}`
+        + (sas ? ` · sas ${sas.toString('hex')}` : '')
+        + ` · R V I F B sh4rd1ng`;
+      pulseColour = PAL.core;
+    } else {
+      pulse = `4l0n3 · R V I F B c0ll4p53d · sh0ut1ng 1nt0 th3 d4rk`;
+      pulseColour = PAL.dim;
+    }
+    cv.write(1, 1, `▸ ${pulse}`, pulseColour);
+    cv.write(1, 2, `  ${this.sporeId.slice(0, 16)} ${this.nick}`, PAL.dim);
+
+    // section rule between the mesh and the log — the divider as structural punctuation
+    const rulePanel = panel + 1;
+    for (let r = 3; r < cv.h - 2; r++) cv.write(rulePanel, r, '⟐', PAL.dormant);
 
     // ---- the disclosure. Plain English, mandatory, non-dismissable.
     // CORRECTNESS.md C3: SP1 has zero content confidentiality. Every VAULT, RELAY and

@@ -68,6 +68,7 @@ function say(text) {
   const n = mgr.broadcast(wire);
   tel.count('hypha.bytes', wire.length * Math.max(1, n));
   tel.event('substrate.appended', { seq: Number(seq), lamport: Number(lamport), toPeers: n, text });
+  view.lamport = Number(lamport);
   view.message(NICK, text);
   return n;
 }
@@ -95,6 +96,7 @@ mgr.on('message', ({ hypha, payload }) => {
     lamport: Number(v.block.lamport),
     text: body.toString('utf8').slice(0, 60),
   });
+  view.lamport = Number(lamport);
   view.message(who, body.toString('utf8').slice(0, 200));
 });
 
