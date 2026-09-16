@@ -668,7 +668,7 @@ engineers (§1.9).**
 
 | Operation | Mechanism | Scales with N? | Over what range | Under what conditions | Asymptote |
 |---|---|---|---|---|---|
-| Cold-start sync, single joiner | BitTorrent-style rarest-first swarm over the mesh | Yes, bounded | N=2 → N≈5 | One shared-medium AP, honest peers, no churn | **3.3× (good AP) / 1.25× (phone hotspot)** vs. single-seeder; flat beyond N≈5 on one AP |
+| Cold-start sync, single joiner | BitTorrent-style rarest-first swarm over the mesh | Yes, bounded | N=2 → N≈5 | One shared-medium AP, honest peers, no churn | **3.55× measured (good AP) / 1.25× (phone hotspot)** vs. single-seeder; flat beyond N=4 on one AP (§3.1) |
 | Cold-start sync, K simultaneous joiners (flash crowd) | Seeder uploads each block once; joiners trade distinct shards | Yes | K=2 → K=10, one AP | **No churn** during the sync window | ~K/3.3× cohort completion vs. K-times-serial upload; degrades toward the serial bound as churn rises (see next row) |
 | Cold-start sync, K joiners, under churn | Same swarm mechanism | **Untested at design time; benchmark required (§6)** | — | 30%/min departure, the mobile-realistic case | Falsifier: must stay within 2× of the no-churn swarm time, or the flash-crowd number is scenario-dependent, not general |
 | Cold-start sync, across C radio domains | Swarm splits load across C independently-airtime-limited cells | Yes, with C | C=1 → C=3 in the design's own benchmark plan | **C additional APs/hotspots already exist in the user's environment** — SPORE does not create them | Cell term divides by C; ~10× at K=10, C=3 in the modeled case |
@@ -682,35 +682,50 @@ engineers (§1.9).**
 | Live message delivery latency | Direct hypha frame delivery | **No, by design, and we say so** | N/A | N/A | Flat at hop-count × hypha-RTT regardless of N; this is a stated non-scaling guarantee, not a gap |
 | Durability | Replication factor R = min(N, 2 or 3) | N/A below N=4 | N ≤ 3: **no sharding occurs at all**, R ≥ N | N=1: device durability only; N=2: 1→2 catch-up copy | Durability requires N ≥ 4 before sharding provides any margin beyond full replication |
 
-### 3.1 Three ceilings, measured separately
+### 3.1 One ceiling, and how it took three tries to measure it
 
-The first version of this table had one ceiling in it: the shared medium. Running the
-falsifier with the medium removed showed that was not the whole story, and that the control
-meant to isolate the medium was quietly measuring something else.
+The measured curve, with the shipped scheduler modelled correctly:
 
-| Configuration | N=5 | N=20 | What binds |
+| N sources | sync | speedup | supply MB/s |
 |---|---|---|---|
-| Real Wi-Fi cell (shared medium, pipeline 6) | **3.59×** | **3.59×** | The air. Flat past N≈5. |
-| No medium, pipeline still 6 deep | 3.68× | **4.75×** | Request concurrency. |
-| No medium, no pipeline cap | 5.38× | **32.30×** | Nothing — supply scales roughly linearly. |
+| 1 | 6.5s | 1.00x | 7.50 |
+| 2 | 3.2s | 2.04x | 15.00 |
+| 3 | 2.1s | 3.11x | 22.50 |
+| **4** | **1.8s** | **3.55x** | **25.00** |
+| 5 → 20 | 1.8s | 3.55x | 25.00 |
 
-The middle row is a ceiling this project did not know it had. One joiner holding six
-outstanding requests can be fed by at most six seeders at any instant, so with 20 sources
-present, fourteen of them are never asked for anything. That is not the shared medium; it
-has a different cause and a completely different fix (`MAX_INFLIGHT_PER_PEER` in
-`src/sharding/sync.js`, not more radios).
+The knee is at **N=4**, and it is arithmetic rather than an empirical surprise: per-spore
+uplink is 7.5 MB/s and the P2P-effective cell is 25 MB/s, so three sources supply 22.5 and
+four supply 30 — the fourth is the first that cannot be spent. Supply pins to 25.00 MB/s and
+stays there through N=20. Control B, the same scheduler with only the shared air removed,
+runs 5.38x at N=5 to **46.14x** at N=20. The gap between 3.55x and 46.14x is the medium and
+nothing else.
 
-An earlier control conflated the two: it lifted the cell cap and the radio ceiling but left
-the pipeline at 6, measured 4.25× → 4.75×, and reported it as evidence about the medium. It
-was evidence about the pipeline. Corrected, the same control reaches 32.30× — supply really
-does scale, and the medium really is what bends the real curve.
+**Getting that number right took three attempts, and the first two failures are more useful
+than the result.**
 
-**The conclusion that matters for phones: inside one Wi-Fi cell the medium binds first
-(3.59× before 4.75×), so raising the pipeline depth buys nothing there.** It becomes the
-binding constraint only once the medium stops being one — that is, across independent radio
-domains, which is the same variable §3's header line already names. The bottom row is what
-SPORE would reach if bandwidth were free, and it is the number that says the scheduler
-itself is not the limit.
+*Attempt 1* collapsed three distinct caps into one constant. `sync.js` limits requests **per
+peer** with no global bound (6 x N outstanding across N peers); the benchmark limited them
+**per joiner** (6, full stop) and additionally capped uploads per seeder, which `sync.js`
+does not do at all. So twenty seeders behaved like six. Control B reported 4.25x → 4.75x and
+failed its own 1.2x threshold. The tempting response — lowering the threshold to match — would
+have buried the discrepancy permanently.
+
+*Attempt 2* lifted the cap to 64 and passed at 32.30x. But a control that changes the policy
+is not a control: it was now measuring a scheduler nobody ships. The 4.75x/32.30x gap was
+written up in this document as a real "second ceiling" caused by request concurrency. **It
+was a modelling artifact and that entry was wrong.** The shipped scheduler has no such
+ceiling at N=20, because its budget grows with peer count.
+
+*Attempt 3* separated `perPeer` / `globalCap` / `uploadCap` and imported `PER_PEER` directly
+from `src/sharding/sync.js`, so the two can no longer drift. Falsifiers 1 and 2 both pass,
+and control B differs from the real run in exactly one variable.
+
+The rule this leaves behind, which matters more than the table: **a benchmark's job is to
+predict the harness.** The moment it models a different policy than the code ships, a
+harness measurement has nothing to check against, and any disagreement between them gets
+blamed on the hardware. Constants that exist in both places must be imported, never
+restated.
 
 ## 4. Corrected interface contract between the six subsystems
 

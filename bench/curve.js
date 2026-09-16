@@ -28,6 +28,7 @@
 // numbers mean what they say. Margin is only ~1.5x, so this stays worth watching.
 
 import { Bitfield, FetchScheduler } from '../src/sharding/scheduler.js';
+import { MAX_INFLIGHT_PER_PEER } from '../src/sharding/sync.js';
 import { Canvas, rgb, mix } from '../src/ui/canvas.js';
 
 const DIV = '⊰-•-•⟐•-•-⦑/Λ\\Ο/Β\\Ε/\\Π/Λ\\Ι/Ν\\Υ/⦒-•-•⟐•-•-⊱';
@@ -43,7 +44,11 @@ const CELL = (25 * 1024 * 1024) / SCALE;       // bytes/sec, P2P-effective (alre
                                                // for the double air traversal)
 const RTT_MS = 3;
 const TICK_MS = 20;
-const MAX_INFLIGHT = 6;
+// Imported, never restated. The bench exists to PREDICT the harness, so the moment it
+// models a different scheduler policy than the one that ships, the harness has nothing to
+// check against. This file previously hard-coded a 6 that meant something different from
+// the code's 6, and produced a ceiling that does not exist. One constant, one meaning.
+const PER_PEER = MAX_INFLIGHT_PER_PEER;
 
 const fmt = (n, d = 1) => n.toFixed(d);
 const mb = (b) => b / 1024 / 1024;
@@ -72,7 +77,15 @@ class Bucket {
  */
 function runSwarm({
   seeders = 1, joiners, cellCap = true, churnEverySec = 0, serial = false, seed = 1,
-  downlink = DOWNLINK, minAlive = 1, maxInflight = MAX_INFLIGHT,
+  downlink = DOWNLINK, minAlive = 1,
+  // Three separate caps, because the code has three separate behaviours and an earlier
+  // version of this bench collapsed them into one number:
+  //   perPeer   requests outstanding to ONE peer          -> sync.js MAX_INFLIGHT_PER_PEER
+  //   globalCap requests outstanding in total             -> sync.js has none; 6 x N
+  //   uploadCap requests one seeder will serve at once    -> sync.js serves all it is asked
+  // Collapsing them made 20 seeders look like 6, which is where the phantom middle
+  // ceiling came from.
+  perPeer = PER_PEER, globalCap = Infinity, uploadCap = Infinity,
 }) {
   let rnd = seed >>> 0;
   const rand = () => ((rnd = (rnd * 1664525 + 1013904223) >>> 0) / 2 ** 32);
@@ -84,8 +97,9 @@ function runSwarm({
     have: isSeeder ? Bitfield.full(TOTAL_BLOCKS) : new Bitfield(TOTAL_BLOCKS),
     up: new Bucket(UPLINK), down: new Bucket(downlink),
     sent: 0, recv: 0, doneAt: 0,
-    downloading: new Set(),  // blocks I am pulling
-    uploading: new Set(),    // blocks I am pushing
+    downloading: new Set(),      // blocks I am pulling, all peers
+    uploading: new Set(),        // blocks I am serving
+    outstanding: new Map(),      // peerId -> Set(index) I have asked THAT peer for
   });
   for (let i = 0; i < seeders; i++) spores.push(mkSpore(`seed${i}`, true));
   for (let i = 0; i < joiners; i++) spores.push(mkSpore(`join${i}`, false));
@@ -124,6 +138,7 @@ function runSwarm({
           if (x.from !== v && x.to !== v) return true;
           inflight.set(x.index, Math.max(0, (inflight.get(x.index) || 1) - 1));
           x.to.downloading.delete(x.index);
+          x.to.outstanding.get(x.peerId)?.delete(x.index);
           x.from.uploading.delete(x.index);
           return false;
         });
@@ -131,22 +146,32 @@ function runSwarm({
       }
     }
 
-    // --- schedule, but only for joiners that actually have a free request slot
+    // --- schedule. Mirrors sync.js pump(): the request budget is per PEER, summed, and
+    //     the limit handed to plan() is exactly what will be issued, per its contract.
     for (const me of working) {
-      if (me.downloading.size >= maxInflight) continue;
+      if (me.downloading.size >= globalCap) continue;
       const peers = new Map();
+      let budget = 0;
       for (const p of alive) {
         if (p === me) continue;
         if (serial && !p.seeder) continue;   // Control A: only the seeder ever serves
-        if (p.uploading.size >= maxInflight) continue;
-        peers.set(p.id, { have: p.have, inflight: p.uploading, maxInflight, ref: p });
+        if (p.uploading.size >= uploadCap) continue;
+        let mine = me.outstanding.get(p.id);
+        if (!mine) { mine = new Set(); me.outstanding.set(p.id, mine); }
+        if (mine.size >= perPeer) continue;
+        peers.set(p.id, { have: p.have, inflight: mine, maxInflight: perPeer, ref: p });
+        budget += perPeer - mine.size;
       }
       if (!peers.size) continue;
-      for (const a of sched.plan(me.have, peers, inflight, replicas, maxInflight - me.downloading.size)) {
+      budget = Math.min(budget, globalCap - me.downloading.size);
+      if (budget <= 0) continue;
+
+      for (const a of sched.plan(me.have, peers, inflight, replicas, budget)) {
         const from = peers.get(a.peerId).ref;
-        transfers.push({ from, to: me, index: a.index, moved: 0, startedAt: t });
+        transfers.push({ from, to: me, peerId: a.peerId, index: a.index, moved: 0, startedAt: t });
         me.downloading.add(a.index);
-        if (me.downloading.size >= maxInflight) break;
+        from.uploading.add(a.index);
+        if (me.downloading.size >= globalCap) break;
       }
     }
 
@@ -155,7 +180,14 @@ function runSwarm({
     let completedAny = false;
     for (let i = transfers.length - 1; i >= 0; i--) {
       const x = transfers[i];
-      if (!x.from.alive || !x.to.alive) { transfers.splice(i, 1); continue; }
+      if (!x.from.alive || !x.to.alive) {
+        inflight.set(x.index, Math.max(0, (inflight.get(x.index) || 1) - 1));
+        x.to.downloading.delete(x.index);
+        x.to.outstanding.get(x.peerId)?.delete(x.index);
+        x.from.uploading.delete(x.index);
+        transfers.splice(i, 1);
+        continue;
+      }
       if (t - x.startedAt < RTT_MS) continue;
 
       let allow = Math.min(BLOCK - x.moved, x.from.up.tokens, x.to.down.tokens);
@@ -176,6 +208,7 @@ function runSwarm({
         if (x.to.have.set(x.index)) replicas[x.index]++;
         inflight.set(x.index, Math.max(0, (inflight.get(x.index) || 1) - 1));
         x.to.downloading.delete(x.index);
+        x.to.outstanding.get(x.peerId)?.delete(x.index);
         x.from.uploading.delete(x.index);
         transfers.splice(i, 1);
         if (x.to.have.complete) { x.to.doneAt = t; completedAny = true; }
@@ -290,49 +323,42 @@ console.log();
 plotCurve(rows).forEach((l) => console.log(l));
 console.log(`${C.dim}   newcomer sync speedup vs control A, by number of sources present${C.off}`);
 
-// Control B: the medium removed — no shared cell, radio RX lifted. If supply itself
-// scales, this must keep climbing exactly where the capped run flattens.
+// Control B: the SHIPPED scheduler policy with the medium removed — no shared cell, radio
+// RX lifted, per-peer depth exactly what sync.js uses. If supply itself scales, this must
+// keep climbing precisely where the capped run flattens. Nothing else is changed, because
+// a control that alters the policy is not a control.
 //
-// It also lifts the request pipeline, and that is not a thumb on the scale — it is a
-// correction. An earlier version of this control left MAX_INFLIGHT at 6 and reported
-// only 4.25x -> 4.75x, failing its own 1.2x threshold. The reason was not that supply
-// stops scaling. It is that ONE joiner with six outstanding requests can be fed by at
-// most six seeders at a time, so the 7th through 20th seeder were never asked for
-// anything. The control was measuring the pipeline depth and calling it the medium.
+// Two earlier versions of this got it wrong in opposite directions, and both were caught
+// by taking the failure seriously instead of adjusting the threshold:
 //
-// So: a control meant to isolate the medium has to remove every OTHER ceiling, and
-// pipeline depth is one of them. That ceiling is real and is now reported in its own
-// right below — it just is not the shared air, and conflating the two would have
-// credited the medium with a limit that has a completely different fix.
+//   v1 collapsed three different caps into one number and left it at 6, so twenty seeders
+//      behaved like six. It reported 4.25x -> 4.75x, failed its own 1.2x threshold, and
+//      the honest-looking response would have been to lower the threshold.
+//   v2 lifted that number to 64 and passed at 32.30x — but by then it was measuring a
+//      scheduler nobody ships, and the gap between the two runs got written up as a real
+//      "second ceiling" in ARCHITECTURE 3.1. It was a modelling artifact.
+//
+// The actual divergence was that sync.js caps requests PER PEER with no global bound
+// (6 x N), while this file capped them per joiner (6, full stop) and also capped uploads
+// per seeder, which sync.js does not do at all. PER_PEER is now imported from sync.js so
+// the two cannot drift again.
 console.log();
 rule();
 const capped20 = rows.at(-1).speedup;
 const n5 = rows.find((r) => r.n === 5).speedup;
 const bFree = (n) => ctrlA.cohortMs / runSwarm({
   seeders: n, joiners: 1, cellCap: false, downlink: DOWNLINK * 10, seed: 7,
-  maxInflight: 64,
 }).firstMs;
 const uncapped5 = bFree(5);
 const uncapped20 = bFree(20);
-
-// Control C: the medium removed but the pipeline left at its real depth. The gap between
-// this and control B is exactly what request concurrency costs, with no radio involved.
-const bPipe = (n) => ctrlA.cohortMs / runSwarm({
-  seeders: n, joiners: 1, cellCap: false, downlink: DOWNLINK * 10, seed: 7,
-}).firstMs;
-const pipe5 = bPipe(5);
-const pipe20 = bPipe(20);
 
 const flat = Math.abs(capped20 - n5) / n5 <= 0.2;
 const bKeepsGaining = uncapped20 > uncapped5 * 1.2;
 
 pulse(`capped    · N=5 ${fmt(n5, 2)}x → N=20 ${fmt(capped20, 2)}x   ${flat ? '[FLAT — the medium binds]' : '[STILL CLIMBING]'}`);
 pulse(`control B · N=5 ${fmt(uncapped5, 2)}x → N=20 ${fmt(uncapped20, 2)}x   ${bKeepsGaining ? '[keeps gaining — supply really does scale]' : '[also flat]'}`);
-pulse(`            no medium, no pipeline cap — supply is the only variable left`);
-pulse(`control C · N=5 ${fmt(pipe5, 2)}x → N=20 ${fmt(pipe20, 2)}x   [no medium, pipeline still 6 deep]`);
-pulse(`            SECOND CEILING: one joiner with ${MAX_INFLIGHT} outstanding requests can be fed`);
-pulse(`            by at most ${MAX_INFLIGHT} seeders at once, so beyond N=${MAX_INFLIGHT} extra sources sit idle.`);
-pulse(`            Nothing to do with the air. Fixed by pipeline depth, not by more radios.`);
+pulse(`            same scheduler, same ${PER_PEER}-deep per-peer pipeline, medium removed.`);
+pulse(`            The ONLY difference from the capped run is the shared air.`);
 rule();
 
 // Flash crowd: K joiners at once. This is where a swarm beats a server outright, because
@@ -370,8 +396,8 @@ console.log(`${C.mag}  VERDICT${C.off}`);
 console.log(`  ${flat ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`} falsifier 1 — capped curve flat N=5→20 (${fmt(n5, 2)}x → ${fmt(capped20, 2)}x)`);
 console.log(`  ${bKeepsGaining ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`} falsifier 2 — uncapped control keeps gaining (${fmt(uncapped5, 2)}x → ${fmt(uncapped20, 2)}x)`);
 console.log(`  ${churnRatio <= 2 ? `${C.cyan}✓${C.off}` : `${C.warn}✗${C.off}`} churn — cohort within 2x of clean (${fmt(churnRatio, 2)}x)`);
-console.log(`${C.dim}  and a ceiling this run separated out: with the medium gone, pipeline depth alone`);
-console.log(`  holds N=20 to ${fmt(pipe20, 2)}x where unlimited concurrency reaches ${fmt(uncapped20, 2)}x.${C.off}`);
+console.log(`${C.dim}  Control B runs the SHIPPED scheduler with only the air removed, so the gap between`);
+console.log(`  ${fmt(capped20, 2)}x and ${fmt(uncapped20, 2)}x at N=20 is the shared medium and nothing else.${C.off}`);
 console.log();
 console.log(`${C.dim}  ARCHITECTURE.md §3 predicts 3.3x saturating near N=5. Measured peak: ${fmt(Math.max(...rows.map((r) => r.speedup)), 2)}x${C.off}`);
 console.log(`${C.dim}  RESOLVED: an earlier run of this benchmark was scaled 10x down because blake2b256`);

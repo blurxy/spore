@@ -49,8 +49,11 @@ export class LogReplica {
     this.bits = new Bitfield(1); // held-set, grows with the log
     this.head = -1; // highest seq we hold
     this.linkedTo = -1; // highest seq reachable by prev_hash from 0
-    this.equivocations = [];
+    this.forks = new Map(); // seq -> { kept, other } block hashes
+    this.forkedAt = Infinity; // lowest seq the author signed twice; the log ends here
   }
+
+  get forked() { return this.forkedAt !== Infinity; }
 
   get held() { return this.blocks.size; }
   has(seq) { return this.blocks.has(seq); }
@@ -68,10 +71,12 @@ export class LogReplica {
    * Called after every insert, because the block that just landed may be the one that
    * closes a gap and promotes a long run at once. Genesis (seq 0) is linked when its
    * prev_hash is all zero; every later block when its prev_hash equals the block before.
+   *
+   * It never advances to or past a fork. See `recordFork`.
    */
   relink() {
     const promoted = [];
-    for (let s = this.linkedTo + 1; ; s++) {
+    for (let s = this.linkedTo + 1; s < this.forkedAt; s++) {
       const b = this.blocks.get(s);
       if (!b) break;
       const d = decodeBlock(b.cert);
@@ -160,10 +165,8 @@ export class Substrate extends EventEmitter {
       // The author signed two different blocks at the same seq. This is not a network
       // fault and not something a peer can fake — both signatures verify under the
       // author's own key. We keep what we had, record the proof, and surface it.
-      r.equivocations.push({ seq, kept: prior.hash, rejected: b.blockHash });
-      this.tel?.count('substrate.equivocation');
-      this.emit('equivocation', { logId: r.logId, seq, kept: prior.hash, rejected: b.blockHash });
-      return { ok: false, reason: 'equivocation', seq };
+      const retracted = this.#recordFork(r, seq, prior.hash, b.blockHash);
+      return { ok: false, reason: 'equivocation', seq, retracted };
     }
 
     r.blocks.set(seq, {
