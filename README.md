@@ -86,9 +86,24 @@ the clock before the next local write. It is derived from deps and rejected if a
 which closes the inflation attack.
 
 ```
-npm test                    # 14 tests, zero dependencies
+npm test                    # 20 tests, zero dependencies
 node bench/render-demo.mjs  # the interface, driven by a real handshake
 ```
+
+## The crypto is verified against the outside world
+
+Hand-written Noise was named in the design as *"where this design most plausibly fails"*.
+It is no longer taken on trust:
+
+- **Noise** replays the official Cacophony vector for `Noise_XX_25519_ChaChaPoly_BLAKE2b`
+  with the vector's own fixed keys, and matches all three handshake messages byte for
+  byte, the published `handshake_hash`, and the transport ciphertexts derived from
+  `Split()`. The pure pattern lives in `NoiseXX`, separate from SPORE's identity binding,
+  precisely so it can be checked this way. The fixture is vendored, so the test suite is
+  as off-web as the product.
+- **BLAKE2b-256** is real RFC 7693, not blake2b512 truncated. It is checked against Node's
+  native blake2b512 at `nn=64` over every block-boundary length and 200 fuzz cases — Node
+  as the oracle — and against the published 256-bit vectors that truncation gets wrong.
 
 ## Everything grows, and every growth is true
 

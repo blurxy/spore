@@ -55,6 +55,13 @@ export function generateStatic() {
   return { privateKey: kp.privateKey, publicKey: kp.publicKey, raw: rawPub(kp.publicKey) };
 }
 
+/** Rebuild an X25519 keypair from a raw 32-byte private key — used to replay test vectors. */
+export function staticFromRaw(rawPrivate) {
+  const privateKey = xPriv(rawPrivate);
+  const publicKey = createPublicKey(privateKey);
+  return { privateKey, publicKey, raw: rawPub(publicKey) };
+}
+
 function dh(privateKey, peerRaw) {
   const secret = diffieHellman({ privateKey, publicKey: xPub(peerRaw) });
   // All-zero output means a low-order point was supplied. Noise says abort; we abort.
@@ -235,7 +242,113 @@ export class CipherPair {
 }
 
 /**
- * Drive the XX handshake. Caller pumps: read() consumes a message, write() produces one.
+ * PURE Noise XX, with no SPORE policy in it at all — arbitrary payloads, and injectable
+ * ephemerals so published test vectors can be replayed exactly.
+ *
+ *   -> e
+ *   <- e, ee, s, es
+ *   -> s, se
+ *
+ * This is deliberately separate from SPORE's identity binding. design-crypto.md named
+ * hand-written Noise as "where this design most plausibly fails"; keeping the raw pattern
+ * isolated is what lets test/noise-vectors.test.js check it against the official
+ * Cacophony vectors byte-for-byte, which is the only real evidence that it is correct.
+ */
+export class NoiseXX {
+  constructor({ initiator, s, e = null, pro = prologue() }) {
+    this.initiator = initiator;
+    this.s = s;
+    this.fixedE = e;
+    this.ss = new SymmetricState(PROTOCOL, pro);
+    this.e = null;
+    this.re = null;
+    this.rs = null;
+    this.step = 0;
+    this.done = false;
+  }
+
+  #ephemeral() {
+    this.e = this.fixedE || generateStatic();
+    return this.e;
+  }
+
+  get handshakeHash() { return this.ss.h; }
+
+  writeMessage(payload = EMPTY) {
+    if (this.initiator && this.step === 0) {
+      const e = this.#ephemeral();
+      this.ss.mixHash(e.raw);
+      const out = Buffer.concat([e.raw, this.ss.encryptAndHash(payload)]);
+      this.step = 1;
+      return out;
+    }
+    if (!this.initiator && this.step === 1) {
+      const e = this.#ephemeral();
+      this.ss.mixHash(e.raw);
+      this.ss.mixKey(dh(e.privateKey, this.re));                    // ee
+      const encS = this.ss.encryptAndHash(rawPub(this.s.publicKey)); // s
+      this.ss.mixKey(dh(this.s.privateKey, this.re));               // es
+      const out = Buffer.concat([e.raw, encS, this.ss.encryptAndHash(payload)]);
+      this.step = 2;
+      return out;
+    }
+    if (this.initiator && this.step === 2) {
+      const encS = this.ss.encryptAndHash(rawPub(this.s.publicKey)); // s
+      this.ss.mixKey(dh(this.s.privateKey, this.re));               // se
+      const out = Buffer.concat([encS, this.ss.encryptAndHash(payload)]);
+      this.step = 3;
+      this.done = true;
+      return out;
+    }
+    throw new NoiseError('out_of_turn_write');
+  }
+
+  /** Returns { payload, hBefore } — hBefore is the transcript as it stood pre-decrypt. */
+  readMessage(msg) {
+    if (!this.initiator && this.step === 0) {
+      if (msg.length < DHLEN) throw new NoiseError('short_msg1');
+      this.re = msg.subarray(0, DHLEN);
+      this.ss.mixHash(this.re);
+      const hBefore = this.ss.h;
+      const payload = this.ss.decryptAndHash(msg.subarray(DHLEN));
+      this.step = 1;
+      return { payload, hBefore };
+    }
+    if (this.initiator && this.step === 1) {
+      if (msg.length < DHLEN + DHLEN + TAGLEN) throw new NoiseError('short_msg2');
+      this.re = msg.subarray(0, DHLEN);
+      this.ss.mixHash(this.re);
+      this.ss.mixKey(dh(this.e.privateKey, this.re));                              // ee
+      this.rs = this.ss.decryptAndHash(msg.subarray(DHLEN, DHLEN + DHLEN + TAGLEN)); // s
+      this.ss.mixKey(dh(this.e.privateKey, this.rs));                              // es
+      const hBefore = this.ss.h;
+      const payload = this.ss.decryptAndHash(msg.subarray(DHLEN + DHLEN + TAGLEN));
+      this.step = 2;
+      return { payload, hBefore };
+    }
+    if (!this.initiator && this.step === 2) {
+      if (msg.length < DHLEN + TAGLEN) throw new NoiseError('short_msg3');
+      this.rs = this.ss.decryptAndHash(msg.subarray(0, DHLEN + TAGLEN)); // s
+      this.ss.mixKey(dh(this.e.privateKey, this.rs));                    // se
+      const hBefore = this.ss.h;
+      const payload = this.ss.decryptAndHash(msg.subarray(DHLEN + TAGLEN));
+      this.step = 3;
+      this.done = true;
+      return { payload, hBefore };
+    }
+    throw new NoiseError('out_of_turn_read');
+  }
+
+  split() {
+    if (!this.done) throw new NoiseError('incomplete');
+    const [t1, t2] = this.ss.split();
+    return this.initiator ? [t1, t2] : [t2, t1]; // [send, recv]
+  }
+}
+
+/**
+ * SPORE's handshake: pure Noise XX plus the identity binding that makes the ed25519 key
+ * the sole per-session authenticator.
  *
  *   -> e
  *   <- e, ee, s, es
