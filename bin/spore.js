@@ -107,17 +107,32 @@ function say(text) {
 
 mgr.on('message', ({ payload }) => tel.count('hypha.bytes', payload.length));
 
-// Every accepted block, however it arrived — pushed live or pulled from a backlog. The
-// substrate has already verified the signature against the key the LOG ID names, not
-// against whoever handed it over, so a block relayed by a stranger is worth exactly as
-// much as one from its author.
-substrate.on('block', ({ logId: lid, seq: s, block, payload, from }) => {
-  if (lid.equals(logId)) return; // our own, already shown by say()
+// Two different questions, answered in two different places.
+//
+// HAVE WE SEEN IT? — 'block'. Fires the moment a block is accepted, in whatever order it
+// arrived, because a signature is self-contained. Causality advances here: we have
+// observed that block, so our lamport must account for it even if the blocks before it
+// are still in flight.
+substrate.on('block', ({ logId: lid, seq: s, block, from }) => {
+  if (lid.equals(logId)) return; // our own
   lamport = deriveLamport(lamport, [block.lamport]);
   view.lamport = Number(lamport);
+  tel.event('substrate.verified', { from, log: lid.toString('hex').slice(0, 6), seq: s, lamport: Number(block.lamport) });
+});
+
+// CAN WE READ IT IN ORDER? — 'linked'. Rarest-first deliberately fetches out of order, so
+// showing messages as they land would scramble a backlog on screen. The linked frontier
+// only advances along prev_hash from seq 0, so this fires in log order, in runs, as gaps
+// close. The design note says scheduling reads `held` and ordered delivery reads `linked`;
+// this is the line where the interface actually obeys it.
+substrate.on('linked', ({ logId: lid, seqs }) => {
+  if (lid.equals(logId)) return; // our own, already shown by say()
+  const rep = substrate.replica(lid.toString('hex'));
   const who = lid.toString('hex').slice(0, 6);
-  tel.event('substrate.verified', { from, log: who, seq: s, lamport: Number(block.lamport) });
-  if (block.type === TYPE.MESSAGE) view.message(who, payload.toString('utf8').slice(0, 200));
+  for (const s of seqs) {
+    const b = rep?.get(s);
+    if (b && b.type === TYPE.MESSAGE) view.message(who, b.payload.toString('utf8').slice(0, 200));
+  }
 });
 
 substrate.on('equivocation', ({ logId: lid, seq: s }) => {

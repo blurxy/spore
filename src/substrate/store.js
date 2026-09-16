@@ -171,6 +171,7 @@ export class Substrate extends EventEmitter {
       payload: Buffer.from(payload),
       hash: b.blockHash,
       lamport: b.lamport,
+      type: b.type,
     });
     r.reserve(seq);
     r.bits.set(seq);

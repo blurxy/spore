@@ -290,6 +290,39 @@ test('sync: cache-on-fetch — a joiner becomes a source before it has finished'
   for (const s of [seeder, first, second]) { s.sync.stop(); await s.mgr.stop(); }
 });
 
+test('sync: a spore that connects while empty is still discoverable as a source', async () => {
+  const author = identity();
+  const blocks = chain(author, 24, 'relay');
+
+  const seeder = spore(47650, { seedFrom: { id: author, blocks } });
+  const middle = spore(47651);
+  const tail = spore(47652);
+  for (const s of [seeder, middle, tail]) await s.mgr.listen();
+  for (const s of [seeder, middle, tail]) s.sync.start();
+
+  // The ordering that matters: `tail` attaches to `middle` while `middle` holds NOTHING,
+  // so `middle` has no full HAVE to send. Everything `tail` ever learns about `middle`
+  // must therefore arrive by HAVE_ADD. If HAVE_ADD is treated as a refinement of a HAVE
+  // that was never sent, `middle` is invisible as a source forever and `tail` sits at
+  // zero — which is the "gets faster as people join" claim failing in exactly the case
+  // it is meant for: everyone arriving at once with nothing.
+  await tail.mgr.dial({ sporeId: middle.id.pub, addrs: ['127.0.0.1'], tcpPort: 47651 });
+  assert.equal(middle.store.size, 0, 'middle must still be empty when tail attaches');
+  await settle(60);
+  assert.equal(tail.store.size, 0, 'nothing to learn yet');
+
+  // Only now does the middle spore get anything to pass on.
+  await middle.mgr.dial({ sporeId: seeder.id.pub, addrs: ['127.0.0.1'], tcpPort: 47650 });
+
+  const key = author.logId.toString('hex');
+  const ok = await until(() => (tail.store.replica(key)?.held || 0) === 24, 8000);
+  assert.ok(ok, `tail reached ${tail.store.replica(key)?.held || 0}/24 — middle was never seen as a source`);
+  assert.equal(tail.store.replica(key).linkedTo, 23);
+  assert.ok(middle.sync.stats.served > 0, 'middle must have re-served what it fetched');
+
+  for (const s of [seeder, middle, tail]) { s.sync.stop(); await s.mgr.stop(); }
+});
+
 test('sync: a peer that withers mid-transfer strands nothing', async () => {
   const author = identity();
   const blocks = chain(author, 60, 'churn');

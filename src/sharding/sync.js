@@ -247,12 +247,33 @@ export class Syncer extends EventEmitter {
     this.pump();
   }
 
+  /**
+   * A peer acquired a block. This message must stand entirely on its own.
+   *
+   * An earlier version treated HAVE_ADD as a refinement of a full HAVE and dropped it
+   * when either the log or the peer was unknown. That quietly destroyed the mechanism the
+   * whole product claim rests on. A full HAVE is sent once, at hypha setup, and is skipped
+   * when the store is empty — so a spore that connects before it holds anything announces
+   * nothing, and every HAVE_ADD it later sends is discarded. It becomes PERMANENTLY
+   * INVISIBLE as a source to every peer it met while empty.
+   *
+   * That is exactly the joiner-becomes-a-source path. Supply would stay pinned at the
+   * original seeders, and "gets faster as more people join" would be false in the one
+   * arrangement where it matters most: everybody arriving at once with nothing.
+   *
+   * So a HAVE_ADD for an unknown log creates the log, and for an unknown peer creates the
+   * peer. We do not know the author yet and do not need to — the BLOCK that comes back
+   * carries the author key, and the store binds the log against log_id on arrival.
+   */
   #recvHaveAdd(peer, body) {
     for (const { logId, seq } of decodePairs(body)) {
-      const l = this.logs.get(Buffer.from(logId).toString('hex'));
-      if (!l) continue; // a log we have never been advertised; the next full HAVE covers it
-      const p = l.peers.get(peer);
-      if (!p) continue;
+      const l = this.#log(logId, null);
+      let p = l.peers.get(peer);
+      if (!p) {
+        p = { have: new Bitfield(seq + 1), inflight: new Set(), maxInflight: MAX_INFLIGHT_PER_PEER };
+        l.peers.set(peer, p);
+        if (!this.peerInflight.has(peer)) this.peerInflight.set(peer, 0);
+      }
       if (seq + 1 > p.have.size) p.have.grow(seq + 1);
       p.have.set(seq);
     }
@@ -286,12 +307,7 @@ export class Syncer extends EventEmitter {
       const l = this.logs.get(Buffer.from(logId).toString('hex'));
       if (!l) continue;
       this.#clearRequest(l, peer, seq);
-      // They told us they don't have it. Believe them and stop asking.
-      const p = l.peers.get(peer);
-      if (p && seq < p.have.size && p.have.has(seq)) {
-        p.have.bits[seq >> 3] &= ~(1 << (seq & 7));
-        p.have.count--;
-      }
+      this.#forget(l, peer, seq); // they told us; believe them and stop asking
       this.stats.noblock++;
     }
     this.tel?.count('sync.noblock');
@@ -364,7 +380,15 @@ export class Syncer extends EventEmitter {
     return Math.max(0, MAX_INFLIGHT_PER_PEER - (this.peerInflight.get(peer) || 0));
   }
 
-  /** Expire requests that will never be answered, and give those blocks back. */
+  /**
+   * Expire requests that will never be answered, and give those blocks back.
+   *
+   * A timeout is an unspoken NOBLOCK, so it is treated as one: the peer's bit for that
+   * block is cleared. Otherwise the scheduler sees a peer with free slots that claims to
+   * hold the block and keeps handing it the same request forever, while the block sits
+   * available at somebody who would have answered. If that peer really does have it, its
+   * next HAVE_ADD or reconnect HAVE says so and it becomes a candidate again.
+   */
   #sweepDeadlines(now) {
     for (const l of this.logs.values()) {
       for (const [k, deadline] of l.deadlines) {
@@ -373,10 +397,19 @@ export class Syncer extends EventEmitter {
         const peer = k.slice(0, i);
         const seq = Number(k.slice(i + 1));
         this.#clearRequest(l, peer, seq);
+        this.#forget(l, peer, seq);
         this.stats.timedOut++;
         this.tel?.count('sync.timeout');
       }
     }
+  }
+
+  /** Stop believing `peer` holds `seq` until they say otherwise. */
+  #forget(l, peer, seq) {
+    const p = l.peers.get(peer);
+    if (!p || seq >= p.have.size || !p.have.has(seq)) return;
+    p.have.bits[seq >> 3] &= ~(1 << (seq & 7));
+    p.have.count--;
   }
 
   /**
