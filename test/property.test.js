@@ -72,6 +72,7 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null,
   const state = ids.map(() => ({ seq: 0, prevHash: Buffer.alloc(32), lastLamport: 0n }));
   const built = []; // { hash, lamport } for dep selection
   const out = [];
+  const cites = []; // { logIdx, seq, ref } — what each member block claimed under
 
   // scope_id is only meaningful once there is a colony to be a member of — and it is not
   // a constant. A colony names its founder, so the id has to be derived from log 0 at the
@@ -105,12 +106,67 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null,
   if (authority) {
     emit(0, { type: TYPE.COLONY_GENESIS, payload: Buffer.from('colony') });
     for (let li = 1; li < logs; li++) {
-      grants[li] = emit(0, {
+      grants[li] = [emit(0, {
         type: TYPE.ROLE_GRANT,
         payload: encodeGrant({ target: ids[li].logId, roleId: li }),
-      }).hash;
+      }).hash];
     }
   }
+
+  /**
+   * A burst of the owner's control statements about one member.
+   *
+   * Two independent choices, and the second one is what this generator was missing. The
+   * PINS are chosen blind to each other, which it always did. The EMISSION ORDER is now
+   * chosen blind to the pins, which it never did: the old version emitted the revocation
+   * and then, maybe, a re-grant — so ownerSeq(revoke) < ownerSeq(grant) in every run it
+   * could produce, on every seed.
+   *
+   * A grant and a revocation are entries in one ordered list sorted by boundary, with the
+   * owner's log position breaking ties at EQUAL boundary. If write order and boundary
+   * order never disagree, nothing here can tell the two apart, and a rule that used the
+   * wrong one of them passes 102 tests and a property fuzzer. That is exactly what
+   * happened: three review lenses found it and this file could not have, at any seed.
+   *
+   * So: statements are shuffled after their pins are picked. Divergence between the two
+   * orderings is the whole point, not a rare accident.
+   */
+  const controlBurst = (target) => {
+    if (!authority || target < 1 || target >= logs || state[target].seq === 0) return;
+    const head = state[target].seq;
+    const stmts = [];
+
+    // The LAYERED shape, deliberately, because independent random pins essentially never
+    // produce it. A revocation pinned at k has boundary k+1; only a grant pinned at exactly
+    // k+1 shares that boundary, and it is the restore-at-the-same-boundary case that makes
+    // anything above it observable at all. Without a restore, the revocation stops the
+    // member at a low seq and every later verdict is hidden behind the contiguous
+    // watermark — which is why a generator full of random revocations still saw nothing.
+    const k = Math.floor(r() * (head + 1));
+    stmts.push({ revoke: true, pinSeq: k });
+    if (r() < 0.7) stmts.push({ revoke: false, pinSeq: k + 1 });          // restores at k+1
+    if (r() < 0.7) stmts.push({ revoke: false, pinSeq: head + 1 + Math.floor(r() * 3) });
+    for (let j = 0, n = Math.floor(r() * 2); j < n; j++) {
+      stmts.push({ revoke: r() < 0.5, pinSeq: Math.floor(r() * (head + 2)) });
+    }
+    for (let k = stmts.length - 1; k > 0; k--) {
+      const j = Math.floor(r() * (k + 1));
+      const t = stmts[k]; stmts[k] = stmts[j]; stmts[j] = t;
+    }
+    for (const st of stmts) {
+      if (st.revoke) {
+        emit(0, {
+          type: TYPE.ROLE_REVOKE,
+          payload: encodeRevoke({ target: ids[target].logId, pinSeq: st.pinSeq, roleId: target }),
+        });
+      } else {
+        grants[target].push(emit(0, {
+          type: TYPE.ROLE_GRANT,
+          payload: encodeGrant({ target: ids[target].logId, pinSeq: st.pinSeq, roleId: target }),
+        }).hash);
+      }
+    }
+  };
 
   for (let i = 0; i < blocks; i++) {
     const li = Math.floor(r() * logs) % logs;
@@ -122,42 +178,37 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null,
       deps = [d.hash];
       depLamport = d.lamport;
     }
+    // Cite ANY grant this member has ever been handed, not only the first. A member
+    // holding an old grant's hash and still using it is the case R6 is about — and the
+    // one the previous generator could not produce, because there was only ever one hash
+    // to cite. Whether that old grant is still in force at this seq is precisely the
+    // question #authCheck exists to answer.
+    const mine = grants[li];
+    const authRef = mine && mine.length ? mine[Math.floor(r() * mine.length)] : null;
+
+    cites.push({
+      logIdx: li,
+      seq: state[li].seq,
+      ref: authRef ? authRef.toString('hex') : null,
+    });
     emit(li, {
       payload: Buffer.from(`log${li}:${state[li].seq}`),
-      authRef: grants[li] || null,
+      authRef,
       deps,
       depLamport,
     });
-  }
 
-  // A revocation lands somewhere in the middle of a member's history. Its pin is chosen
-  // blind to what that member went on to write, which is the realistic case: the owner
-  // revokes against the head they had, not the head that exists.
-  if (authority && logs > 1) {
-    const target = 1 + Math.floor(r() * (logs - 1));
-    if (state[target].seq > 0) {
-      const pinSeq = Math.floor(r() * state[target].seq);
-      emit(0, {
-        type: TYPE.ROLE_REVOKE,
-        payload: encodeRevoke({ target: ids[target].logId, pinSeq, roleId: target }),
-      });
-      // And sometimes the owner changes their mind. A re-grant at a pin chosen blind to
-      // where the revocation landed is the case worth shuffling: grants and revocations
-      // are now entries in ONE ordered list per member, so which of them governs a given
-      // block is decided by boundary and then by position in the owner's log — never by
-      // which one this replica happened to receive first.
-      if (r() < 0.5) {
-        emit(0, {
-          type: TYPE.ROLE_GRANT,
-          payload: encodeGrant({
-            target: ids[target].logId,
-            pinSeq: Math.floor(r() * (state[target].seq + 1)),
-            roleId: target,
-          }),
-        });
-      }
+    // Control blocks land BETWEEN a member's blocks, not only after all of them. Emitting
+    // them at the end meant no member block could ever cite a re-grant, so the supersede
+    // path was unreachable however many seeds ran.
+    if (authority && logs > 1 && r() < 0.08) {
+      controlBurst(1 + Math.floor(r() * (logs - 1)));
     }
   }
+
+  // One last burst after everything, so a member's whole history can be spoken about in
+  // arrears. The owner revokes against the head they had, not the head that exists.
+  if (authority && logs > 1) controlBurst(1 + Math.floor(r() * (logs - 1)));
 
   // A planted equivocation: the same author signs a second, different block at one seq.
   if (forkAt !== null) {
@@ -177,7 +228,7 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null,
       out.push({ cert, payload, authorPub: id.pub, logIdx: 0, seq: forkAt, isFork: true });
     }
   }
-  return { ids, blocks: out, scopeId };
+  return { ids, blocks: out, scopeId, cites };
 }
 
 // prevHash of an already-built block, recovered from its cert (offset 60, 32 bytes) by
@@ -611,5 +662,92 @@ test('property: a lossy swarm still converges on whatever it managed to fetch', 
     assert.equal(b.store.replica(key)?.linkedTo, 24,
       `seed ${seed}: joiner reached ${b.store.replica(key)?.linkedTo} of 24`);
     a.sync.stop(); b.sync.stop();
+  }
+});
+
+// --- authority oracle -------------------------------------------------------------------
+
+/**
+ * Where SHOULD a member's frontier stop, read straight off the rule list.
+ *
+ * Deliberately naive: no sorted-list assumption, no early break, no sharing of code with
+ * #authCheck. It re-derives "which statement governs seq N" by scanning everything that
+ * reaches N and taking the maximum by (boundary, ownerSeq) — the ordering R6 defines.
+ *
+ * What this does and does not prove, stated plainly, because the distinction is the whole
+ * reason this function exists:
+ *
+ *   The other properties in this file assert CONVERGENCE — replicas fed the same blocks in
+ *   any order reach the same state. That cannot catch a deterministic logic error: when
+ *   every replica computes the same wrong verdict, they agree perfectly and every seed
+ *   passes. The supersession bug did exactly that, and no amount of shuffling or seeds
+ *   could ever have found it. Agreement is not correctness.
+ *
+ *   This is a differential check against a second reading of the same rule list, so it
+ *   catches a CONSUMER that diverges from the rule the PRODUCER built — which is what the
+ *   bug was: #rebuildAuth's list was right, #authCheck read it by the wrong key. It does
+ *   not independently validate the rule itself. If R6 is wrong, both readings are wrong
+ *   together and this stays silent. It is a regression oracle, not a discovery oracle.
+ */
+function oracleFirstStop(rule, citations, upTo) {
+  const stronger = (a, b) => a.boundary > b.boundary
+    || (a.boundary === b.boundary && a.ownerSeq > b.ownerSeq);
+
+  for (let seq = 0; seq <= upTo; seq++) {
+    const ref = citations.get(seq);
+    if (ref === undefined) return seq;   // no such block; the chain ended
+    if (ref === null) continue;          // claims nothing — answered before any of this
+    if (!rule || !rule.length) return seq;
+
+    const reaching = rule.filter((e) => e.boundary <= seq);
+    if (!reaching.length) return seq;    // the owner has said nothing that reaches here
+
+    let gov = reaching[0];
+    for (const e of reaching) if (stronger(e, gov)) gov = e;
+    if (gov.kind === 'revoke') return seq;
+
+    const cited = rule.find((e) => e.kind === 'grant' && e.hash === ref);
+    if (!cited || cited.boundary > seq) return seq;
+    for (const e of reaching) {
+      if (e.kind === 'revoke' && stronger(e, cited)) return seq;
+    }
+  }
+  return null; // nothing stops it
+}
+
+test('property: the delivery frontier matches an independent reading of the rule list', () => {
+  // The test that would have caught the supersession bug, and the kind this file did not
+  // have. Everything else here asks whether replicas AGREE. This asks whether they are
+  // RIGHT — against a second, deliberately clumsy reading of the same authority rules.
+  //
+  // Only logs whose ordering is complete are checked: linkedTo is bounded by orderedTo as
+  // well as by authority, and a frontier held back by an unresolved dep says nothing about
+  // whether the authority verdict was correct.
+  for (let seed = 1; seed <= 60; seed++) {
+    const r = rng(seed);
+    const w = buildWorld(r, { logs: 3, blocks: 30, depChance: 0.2, authority: true });
+
+    const s = new Substrate();
+    for (const b of shuffled(rng(seed * 7919), w.blocks)) {
+      s.insert(b.cert, b.payload, b.authorPub);
+    }
+
+    const scope = w.scopeId.toString('hex');
+    for (let li = 1; li < w.ids.length; li++) {
+      const key = w.ids[li].logId.toString('hex');
+      const rep = s.replica(key);
+      if (!rep || rep.chainTo < 0) continue;
+      if (rep.orderedTo !== rep.chainTo) continue; // ordering, not authority, is the limit
+
+      const citations = new Map();
+      for (const c of w.cites) if (c.logIdx === li) citations.set(c.seq, c.ref);
+
+      const rule = s.auth.rule.get(`${key}|${scope}`) || [];
+      const stop = oracleFirstStop(rule, citations, rep.chainTo);
+      const expected = stop === null ? rep.chainTo : stop - 1;
+
+      assert.equal(rep.linkedTo, expected,
+        `seed ${seed}, log ${li}: frontier is ${rep.linkedTo}, the rule list says ${expected}`);
+    }
   }
 });
