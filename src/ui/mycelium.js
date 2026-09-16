@@ -30,6 +30,31 @@ export const PAL = {
 };
 
 /** Critically damped spring. Overshoot reads as bouncy; growth should read as inevitable. */
+/**
+ * The integrator, per GROWTH.md §1. Semi-implicit Euler at a FIXED timestep, fed by an
+ * accumulator — never one Euler step of whatever size the frame happened to be.
+ *
+ * The reason is the whole point of the section: "the TUI samples at 30fps and the canvas
+ * at 60fps, but identical substeps mean both renderers produce bit-comparable motion — a
+ * peer joining looks the same curve in a terminal and a browser, just sampled at a
+ * different rate." Variable-dt Euler cannot do that. It was measured at 5.6% of full
+ * travel apart between 30fps and 60fps a quarter-second in, which is a visibly different
+ * curve, not a rounding difference.
+ *
+ * The clamp is 250 ms and 30 substeps rather than the obvious 33 ms, because §5's
+ * backpressure governor can drop the TUI to 8fps and 125 ms at 1/120 is ~15 substeps. A
+ * smaller cap would silently discard 92 ms of every degraded frame and every spring would
+ * run in visible slow motion — the follower law is frame-rate independent by design, but a
+ * fixed-step integrator with too small a substep cap is not.
+ *
+ * Time beyond the clamp is DROPPED, not banked. A process suspended for a minute resumes
+ * where it stopped; nothing was measured during the gap either, so integrating a minute of
+ * motion on return would be inventing it.
+ */
+export const FIXED_DT = 1 / 120;
+export const MAX_ACCUM = 0.25;
+export const MAX_SUBSTEPS = 30;
+
 export class Spring {
   constructor(value = 0, stiffness = 26) {
     this.x = value;
@@ -37,12 +62,18 @@ export class Spring {
     this.target = value;
     this.k = stiffness;
     this.c = 2 * Math.sqrt(stiffness); // critical damping
+    this.acc = 0;
   }
   to(target) { this.target = target; return this; }
   step(dt) {
-    const d = Math.min(dt, 0.05); // clamp so a stalled frame cannot explode the sim
-    this.v += (-this.k * (this.x - this.target) - this.c * this.v) * d;
-    this.x += this.v * d;
+    if (dt > 0) this.acc = Math.min(this.acc + dt, MAX_ACCUM);
+    let n = 0;
+    while (this.acc >= FIXED_DT && n < MAX_SUBSTEPS) {
+      this.v += (-this.k * (this.x - this.target) - this.c * this.v) * FIXED_DT;
+      this.x += this.v * FIXED_DT;
+      this.acc -= FIXED_DT;
+      n += 1;
+    }
     return this.x;
   }
 }
