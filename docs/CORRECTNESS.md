@@ -490,7 +490,7 @@ ARCHITECTURE.md so this claim is corrected rather than repeated.
 | C7 — snapshot corroboration Sybil-cheap | SERIOUS | §1.17 (new); §4 SUBSTRATE entry notes membership-drawn corroborators (SP2) |
 | C8 — Noise wire-size arithmetic / nonce-reset inconsistency | SERIOUS | §1.18 (new); §5 item 3 adds Noise test-vector fixture as a scope item; §6 |
 | C9 — DEVICE_LINK vs MEMBER_BAN scope undefined | ANNOYING | Not folded into ARCHITECTURE.md (task scope: FATAL/SERIOUS only) — recorded here only |
-| V1 — stale `auth_ref`/lamport enables privilege replay | FATAL | §1.19 (new); §2 "Permission resolution" paragraph corrected (same paragraph as C1, different clause) |
+| V1 — stale `auth_ref`/lamport enables privilege replay | FATAL | §1.19 (new); §2 "Permission resolution" paragraph corrected (same paragraph as C1, different clause). **CLOSED in code, by a rule §1.19 did not propose** — see ARCHITECTURE R4. The fix §1.19 adopted does not close V1: "a naturally low lamport" is attacker-chosen, so causal binding and lamport bounds both pass the attack, and the bounded-gap clause is measured against a receiver-local frontier and is non-convergent. `ROLE_REVOKE` pins the target's log at a seq instead. `test/auth.test.js` |
 | V2 — churn freezes `stable_lamport`, compaction never engages | SERIOUS | §1.20 (new); §4 SUBSTRATE entry notes presumed-departed exclusion; §5 item 4 |
 | V3 — gossip-lag creates real zero-holder windows for a role | SERIOUS | §1.21 (new); §4 ROLES entry adds staleness cutoff; §5 item 6 |
 | V4 — HRW hash is cheaply Sybil-grindable after dropping the version seed | SERIOUS | §1.22 (new); §2 "HRW seed and convergence" paragraph corrected (claim retracted, not silently re-resolved); Open Decision #3 updated |

@@ -20,7 +20,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
-import { encodeBlock, logIdFor, TYPE, FLAG } from '../src/substrate/block.js';
+import { encodeBlock, logIdFor, TYPE, FLAG, encodeGrant, encodeRevoke } from '../src/substrate/block.js';
 import { Substrate } from '../src/substrate/store.js';
 import { Syncer, MAX_INFLIGHT_PER_PEER } from '../src/sharding/sync.js';
 import {
@@ -65,30 +65,23 @@ function identity() {
  * and every lamport is the derived value — otherwise nothing would link and the whole
  * test would pass vacuously while asserting nothing.
  */
-function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null } = {}) {
+function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null, authority = false } = {}) {
   const ids = Array.from({ length: logs }, identity);
   const state = ids.map(() => ({ seq: 0, prevHash: Buffer.alloc(32), lastLamport: 0n }));
   const built = []; // { hash, lamport } for dep selection
   const out = [];
 
-  for (let i = 0; i < blocks; i++) {
-    const li = Math.floor(r() * logs) % logs;
+  // scope_id is only meaningful once there is a colony to be a member of.
+  const scopeId = authority ? Buffer.alloc(16, 0xc0) : Buffer.alloc(16);
+
+  const emit = (li, { type = TYPE.MESSAGE, payload, authRef = null, deps = [], depLamport = 0n }) => {
     const id = ids[li];
     const st = state[li];
-
-    let deps = [];
-    let depLamport = 0n;
-    if (built.length && r() < depChance) {
-      const d = pick(r, built);
-      deps = [d.hash];
-      depLamport = d.lamport;
-    }
     const lamport = (st.lastLamport > depLamport ? st.lastLamport : depLamport) + 1n;
-    const payload = Buffer.from(`log${li}:${st.seq}`);
     const { cert, blockHash } = encodeBlock(
       {
-        type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId,
-        seq: st.seq, lamport, prevHash: st.prevHash, payload, deps,
+        type, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq: st.seq, lamport, scopeId,
+        prevHash: st.prevHash, authRef: authRef || Buffer.alloc(32), payload, deps,
       },
       id.kp.privateKey,
     );
@@ -97,6 +90,53 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null 
     st.prevHash = blockHash;
     st.lastLamport = lamport;
     st.seq += 1;
+    return { hash: blockHash, lamport, seq: st.seq - 1 };
+  };
+
+  // Log 0 is the colony owner: genesis first, then one grant per member. Everything the
+  // members write afterwards claims under its grant, so every shuffled arrival order has
+  // to reach the same frontier through the authority rules, not just the chaining ones.
+  const grants = [];
+  if (authority) {
+    emit(0, { type: TYPE.COLONY_GENESIS, payload: Buffer.from('colony') });
+    for (let li = 1; li < logs; li++) {
+      grants[li] = emit(0, {
+        type: TYPE.ROLE_GRANT,
+        payload: encodeGrant({ target: ids[li].logId, roleId: li }),
+      }).hash;
+    }
+  }
+
+  for (let i = 0; i < blocks; i++) {
+    const li = Math.floor(r() * logs) % logs;
+
+    let deps = [];
+    let depLamport = 0n;
+    if (built.length && r() < depChance) {
+      const d = pick(r, built);
+      deps = [d.hash];
+      depLamport = d.lamport;
+    }
+    emit(li, {
+      payload: Buffer.from(`log${li}:${state[li].seq}`),
+      authRef: grants[li] || null,
+      deps,
+      depLamport,
+    });
+  }
+
+  // A revocation lands somewhere in the middle of a member's history. Its pin is chosen
+  // blind to what that member went on to write, which is the realistic case: the owner
+  // revokes against the head they had, not the head that exists.
+  if (authority && logs > 1) {
+    const target = 1 + Math.floor(r() * (logs - 1));
+    if (state[target].seq > 0) {
+      const pinSeq = Math.floor(r() * state[target].seq);
+      emit(0, {
+        type: TYPE.ROLE_REVOKE,
+        payload: encodeRevoke({ target: ids[target].logId, pinSeq, roleId: target }),
+      });
+    }
   }
 
   // A planted equivocation: the same author signs a second, different block at one seq.
@@ -109,7 +149,7 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null 
       const { cert } = encodeBlock(
         {
           type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq: forkAt,
-          lamport: 1n + BigInt(forkAt),
+          lamport: 1n + BigInt(forkAt), scopeId,
           prevHash: prev ? require_hash(prev) : Buffer.alloc(32), payload,
         },
         id.kp.privateKey,
@@ -117,7 +157,7 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null 
       out.push({ cert, payload, authorPub: id.pub, logIdx: 0, seq: forkAt, isFork: true });
     }
   }
-  return { ids, blocks: out };
+  return { ids, blocks: out, scopeId };
 }
 
 // prevHash of an already-built block, recovered from its cert (offset 60, 32 bytes) by
@@ -157,6 +197,11 @@ test('property: replicas fed the same blocks in any order reach the same state',
       logs: 1 + Math.floor(r() * 3),
       blocks: 12 + Math.floor(r() * 24),
       forkAt: r() < 0.4 ? 1 + Math.floor(r() * 4) : null,
+      // Half the seeds carry a colony: genesis, grants, and a revocation whose pin lands
+      // mid-history. Authority is the third thing that can stop a frontier, and it is the
+      // only one that can stop it because of a block in SOMEBODY ELSE'S log — so it is the
+      // one most likely to come out order-dependent.
+      authority: r() < 0.5,
     });
 
     let reference = null;

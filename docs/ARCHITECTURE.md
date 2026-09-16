@@ -392,14 +392,30 @@ spore computes the identical, wrong outcome, because the mechanism is a pure fun
 attacker-chosen fields. The worked example is not itself broken by this (B's real power never
 exceeds A's), but the general safety property it is used to justify does not hold.
 
-**Fix, adopted:** `auth_ref` must be causally bound to the block's own `deps`/own-log frontier
-— it must equal or descend from the most recent `AUTH_SNAPSHOT` reachable from the block's own
-dep set at authoring time, **verified by recomputation on ingest, not accepted on the
-author's assertion**. A control block whose `auth_ref`/lamport gap from the current resolved
-frontier exceeds a bounded threshold is rejected outright (soft-failed, flagged for human
-review) rather than merged as if it were current. This is recorded as a correction to the
-"Permission resolution" entry in §2 — the worked example demonstrated agreement, not safety,
-and this fix is what makes the safety property actually hold.
+**Fix, as originally adopted:** `auth_ref` must be causally bound to the block's own
+`deps`/own-log frontier — it must equal or descend from the most recent `AUTH_SNAPSHOT`
+reachable from the block's own dep set at authoring time, **verified by recomputation on
+ingest, not accepted on the author's assertion**. A control block whose `auth_ref`/lamport gap
+from the current resolved frontier exceeds a bounded threshold is rejected outright
+(soft-failed, flagged for human review) rather than merged as if it were current.
+
+**Correction, on implementing it (see R4 below): neither half of that fix closes V1, and the
+second half cannot be built at all.** Both were written before anyone tried to satisfy them.
+
+The causal-binding half asks whether the cited grant is the most recent one in the block's own
+causal cut. It is — the cut is the attacker's, and a moderator who simply does not cite their
+own demotion has a cut in which the stale grant is still current. The same objection kills
+every variant that compares the two blocks' lamports, because V1's own wording is *"a naturally
+low lamport"*: the attacker chooses that number, and chooses it low. That is not a detail of the
+attack, it **is** the attack.
+
+The bounded-gap half measures the gap "from the current resolved frontier", which is a
+receiver-local, time-varying quantity. Two honest spores holding an identical set of blocks
+would reject differently and never reconcile — it is the arrival-order convergence bug wearing
+a different hat, reintroduced by the fix for a different bug. **Not implemented, and it should
+not be.**
+
+What an author does not control is their own `seq`. The shipped rule is in R4.
 
 ### 1.20 Ordinary churn permanently freezes compaction's trigger — SERIOUS
 
@@ -966,6 +982,45 @@ the SP3 target is: Android carries the mesh; iOS ships as a client onto an Andro
 mesh until the entitlement exists. The Braille subpixel renderer does not map to a
 touchscreen and needs a canvas path, but the telemetry bus underneath it is already the right
 shape and is reused unchanged — every growth stays bound to the same measured quantity.
+
+**R4. `auth_ref` is policed by a seq pin in the revocation, not by causality or by lamport.**
+
+§1.19's adopted fix does not close §1.19. Implementing it is what revealed that; the argument
+is written out in full above and in `src/substrate/store.js`, and the short version is that
+V1's attacker picks both the lamport and the dep set, so every rule phrased in terms of either
+is a rule the attacker satisfies for free.
+
+The one field an author cannot choose is their own `seq`. So:
+
+> `ROLE_REVOKE` carries `(target_log_id, pin_seq)`, where `pin_seq` is the revoker's view of
+> the target's head. A block by the target, at `seq > pin_seq`, carrying a non-zero `auth_ref`,
+> **stops that log's frontier** — the same deterministic halt a bad lamport or a fork gets.
+
+Single-writer, append-only logs make the pin inescapable: every block the target writes after
+the revoker looked is above the pin, whatever lamport it claims, and writing at or below the
+pin is not evasion but equivocation, which already ends the log. The rule is a pure function of
+blocks held, so two spores holding the same blocks always agree.
+
+Three consequences, recorded rather than fixed:
+
+1. **Deterministic over-revocation.** If the pin lags the target's real head, blocks the target
+   wrote in between stop too. The revoker is saying "out, as of what I had seen." Every spore
+   over-revokes identically, which is the property that matters.
+2. **Link-then-retract is normal here.** A spore that meets the block before the revocation
+   links it, then withdraws it when the revocation arrives. That is the existing fork-cascade
+   machinery on a second trigger, and it is what `design-substrate.md`'s
+   `soft_failed(..., wasApplied: true)` — *"the local user saw it succeed and must be told it
+   reverted"* — was always describing.
+3. **Grant-of-grant is SP2, and the reason is structural.** Only the colony owner's revocations
+   count, and the owner is never revoked, so the owner's frontier can never be stopped by this
+   rule, so the set of valid revocations cannot shrink while frontiers are recomputed — which
+   is what makes the recomputation reach a fixed point. Under delegation a counter-revocation
+   can un-stop a log, which can link a revocation, which stops another; the set stops being
+   monotone and the fixed point is no longer guaranteed. Delegation needs that argument
+   rebuilt, not just more code.
+
+Block type numbers follow `design/design-substrate.md` (`0x20-26`), not `ENCRYPTION.md`, whose
+`0x31 MEMBER_LEAVE` collides with `design-substrate.md`'s `0x31 STATE_SNAPSHOT`.
 
 ## Open Decisions
 
