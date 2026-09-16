@@ -94,21 +94,42 @@ export function colonyIdFor(founderLogId, seq) {
  * The cost, stated plainly rather than fixed: if the revoker's pin lags the target's real
  * head, blocks the target wrote in between are stopped too. The revoker is saying "out, as
  * of what I had seen," and that is deterministic over-revocation, identical on every spore.
+ *
+ * GRANT CARRIES A PIN TOO, and the two become one rule rather than two. Each control block
+ * names a BOUNDARY in the target's log — a GRANT governs from `pin_seq`, a REVOKE from
+ * `pin_seq + 1` — and the block that governs any given seq is the one with the largest
+ * boundary at or below it, ties going to the later block in the owner's own log.
+ *
+ * That single lookup is what makes re-grant possible without reopening V1. An owner who
+ * revoked at `k` and then re-grants at pin 0 has NOT blessed the replay at `k+1`: the
+ * revocation's boundary `k+1` is still the largest one at or below `k+1`, so it still
+ * governs and still stops. To lift the stop the owner must say so explicitly, with a pin
+ * at or above `k+1`, and then the tie-break hands it to the later block. The intent has to
+ * be written down; it cannot be arrived at by accident.
+ *
+ * An earlier design computed a GRANT's effective boundary as `max(pin_seq, k+1)` over
+ * every preceding revocation. That is subsumed by "largest boundary wins" and having both
+ * would have meant two rules that can disagree.
  */
-export const GRANT_LEN = 20;
+export const GRANT_LEN = 28;
 export const REVOKE_LEN = 28;
 
-export function encodeGrant({ target, roleId = 0 }) {
+export function encodeGrant({ target, pinSeq = 0, roleId = 0 }) {
   if (target.length !== 16) throw new Error(`target must be 16 bytes, got ${target.length}`);
   const p = Buffer.alloc(GRANT_LEN);
   target.copy(p, 0);
-  p.writeUInt32LE(roleId, 16);
+  p.writeBigUInt64LE(BigInt(pinSeq), 16);
+  p.writeUInt32LE(roleId, 24);
   return p;
 }
 
 export function decodeGrant(payload) {
   if (payload.length !== GRANT_LEN) throw new Error(`grant payload ${payload.length}, want ${GRANT_LEN}`);
-  return { target: payload.subarray(0, 16), roleId: payload.readUInt32LE(16) };
+  return {
+    target: payload.subarray(0, 16),
+    pinSeq: payload.readBigUInt64LE(16),
+    roleId: payload.readUInt32LE(24),
+  };
 }
 
 export function encodeRevoke({ target, pinSeq, roleId = 0 }) {

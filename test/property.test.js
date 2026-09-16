@@ -141,6 +141,21 @@ function buildWorld(r, { logs = 3, blocks = 24, depChance = 0.35, forkAt = null,
         type: TYPE.ROLE_REVOKE,
         payload: encodeRevoke({ target: ids[target].logId, pinSeq, roleId: target }),
       });
+      // And sometimes the owner changes their mind. A re-grant at a pin chosen blind to
+      // where the revocation landed is the case worth shuffling: grants and revocations
+      // are now entries in ONE ordered list per member, so which of them governs a given
+      // block is decided by boundary and then by position in the owner's log — never by
+      // which one this replica happened to receive first.
+      if (r() < 0.5) {
+        emit(0, {
+          type: TYPE.ROLE_GRANT,
+          payload: encodeGrant({
+            target: ids[target].logId,
+            pinSeq: Math.floor(r() * (state[target].seq + 1)),
+            roleId: target,
+          }),
+        });
+      }
     }
   }
 

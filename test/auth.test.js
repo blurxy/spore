@@ -291,20 +291,24 @@ test('auth_ref = 0 is unaffected by any of this', () => {
 
 test('grant/revoke payloads round-trip and reject wrong lengths', () => {
   const target = Buffer.alloc(16, 0x7e);
-  const g = encodeGrant({ target, roleId: 9 });
+  const g = encodeGrant({ target, pinSeq: 7, roleId: 9 });
   const r = encodeRevoke({ target, pinSeq: 2n ** 40n, roleId: 3 });
-  assert.equal(g.length, 20);
-  assert.equal(r.length, 28);
 
   assert.ok(decodeGrant(g).target.equals(target));
+  assert.equal(decodeGrant(g).pinSeq, 7n);
   assert.equal(decodeGrant(g).roleId, 9);
   assert.equal(decodeRevoke(r).pinSeq, 2n ** 40n);
   assert.equal(decodeRevoke(r).roleId, 3);
 
-  // A length check is the whole of the parser's defence here, so it is the whole of the
-  // test: a revoke read as a grant would silently take pin_seq's low bytes as a role id.
-  assert.throws(() => decodeRevoke(g), /revoke payload 20/);
-  assert.throws(() => decodeGrant(r), /grant payload 28/);
+  // The two payloads now share a layout, so length no longer tells them apart — and an
+  // earlier version of this test leaned on exactly that. What distinguishes them is the
+  // block TYPE at header offset 1, which is inside the signed region, so it is the author's
+  // statement rather than the parser's guess. Length-sniffing was never the real defence;
+  // it just happened to work while the two differed.
+  assert.equal(g.length, r.length);
+  assert.notEqual(TYPE.ROLE_GRANT, TYPE.ROLE_REVOKE);
+  assert.throws(() => decodeGrant(Buffer.alloc(20)), /grant payload 20/);
+  assert.throws(() => decodeRevoke(Buffer.alloc(20)), /revoke payload 20/);
   assert.throws(() => encodeGrant({ target: Buffer.alloc(8) }), /16 bytes/);
 });
 
@@ -640,4 +644,176 @@ test('review: a stranger cannot make a spore rebuild its whole authority on dema
   assert.equal(tel.n, after,
     `${tel.n - after} full re-resolutions bought by a stranger writing blocks in their own log`);
   assert.equal(s.replica(O.logId.toString('hex')).linkedTo, 40, 'and the owner is unharmed');
+});
+
+// --- re-grant ------------------------------------------------------------------------
+//
+// GRANT and REVOKE both name a BOUNDARY in the target's log: a grant governs from its pin,
+// a revocation from its pin + 1. Whichever has the largest boundary at or below a block's
+// seq governs that block, ties going to the later block in the owner's own log. One rule,
+// one lookup, and it subsumes the pin scan it replaces.
+
+function colony({ ownerTraffic = 0 } = {}) {
+  const O = identity();
+  const M = identity();
+  const scopeId = colonyIdFor(O.logId, 0);
+  const ow = writer(O, scopeId);
+  const mw = writer(M, scopeId);
+  const blocks = [ow.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('colony') })];
+  for (let i = 0; i < ownerTraffic; i++) blocks.push(ow.push({ payload: Buffer.from(`o${i}`) }));
+  const grant = (pinSeq) => ow.push({
+    type: TYPE.ROLE_GRANT, payload: encodeGrant({ target: M.logId, pinSeq }),
+  });
+  const revoke = (pinSeq) => ow.push({
+    type: TYPE.ROLE_REVOKE, payload: encodeRevoke({ target: M.logId, pinSeq }),
+  });
+  return { O, M, scopeId, ow, mw, blocks, grant, revoke };
+}
+
+test('re-grant: an owner can let someone back in, going forward', () => {
+  // The member is revoked at pin 2, writes NOTHING while out, and is re-granted from 3.
+  // Writing nothing is not a detail of the test, it is the whole shape of the feature —
+  // see the next test for why.
+  const c = colony();
+  const g1 = c.grant(0);
+  const early = [0, 1, 2].map(() => c.mw.push({ payload: Buffer.from('before'), authRef: g1.hash }));
+  const rev = c.revoke(2);   // boundary 3
+  const g2 = c.grant(3);     // boundary 3, written later in the owner's log, so it wins
+  const back = [3, 4].map(() => c.mw.push({ payload: Buffer.from('back'), authRef: g2.hash }));
+
+  const s = new Substrate();
+  load(s, [...c.blocks, g1, ...early, rev, g2, ...back]);
+
+  assert.equal(s.replica(c.M.logId.toString('hex')).linkedTo, 4,
+    'the frontier reaches the blocks written under the new grant');
+  assert.equal(early.length, 3);
+  assert.equal(back[1].seq, 4);
+});
+
+test('re-grant: a member who wrote while revoked is out for good, and that is the chain', () => {
+  // The limitation, stated rather than discovered later. linkedTo is a CONTIGUOUS
+  // watermark over a single-writer chain, so a block that stops the frontier stops
+  // everything above it forever — no later grant can reach past a hole, because a hole in
+  // a hash chain is not a thing that can exist.
+  //
+  // So re-grant lifts a revocation for a member who stayed quiet while out. A member who
+  // kept writing has ended their own log at the first block they wrote without authority.
+  // Their remedy is a new identity, which is a new log, which is honest: the old log
+  // really does contain blocks nobody authorised.
+  const c = colony();
+  const g1 = c.grant(0);
+  const early = [0, 1, 2].map(() => c.mw.push({ payload: Buffer.from('before'), authRef: g1.hash }));
+  const rev = c.revoke(2);
+  const defiant = c.mw.push({ payload: Buffer.from('anyway'), authRef: g1.hash }); // seq 3
+  const g2 = c.grant(4);
+  const after = c.mw.push({ payload: Buffer.from('forgiven?'), authRef: g2.hash }); // seq 4
+
+  const s = new Substrate();
+  load(s, [...c.blocks, g1, ...early, rev, defiant, g2, after]);
+
+  assert.equal(s.replica(c.M.logId.toString('hex')).linkedTo, 2,
+    'the log still ends at the block written without authority');
+  assert.equal(defiant.seq, 3);
+  assert.equal(after.seq, 4);
+  assert.equal(early.length, 3);
+});
+
+test('re-grant: a pin of 0 after a revocation does NOT bless the replay', () => {
+  // The security property, and the reason the boundary rule is one lookup rather than two
+  // rules. An owner who revoked at k and then re-grants from 0 has blessed nothing above k:
+  // the revocation's boundary k+1 is still the largest one at or below k+1, so it still
+  // governs and still stops. Lifting the stop has to be said out loud, with a pin >= k+1.
+  const w = v1World();
+  const forgiving = w.ow.push({
+    type: TYPE.ROLE_GRANT, payload: encodeGrant({ target: w.M.logId, pinSeq: 0 }),
+  });
+
+  const s = new Substrate();
+  load(s, [w.genesis, w.grant, ...w.mBefore, ...w.traffic, w.revoke, forgiving, w.replay]);
+
+  assert.equal(s.replica(w.M.logId.toString('hex')).linkedTo, w.pinSeq,
+    'the replayed block is still stopped; a sweeping re-grant is not a pardon for it');
+});
+
+test('re-grant: an older grant still in force is fine; a superseded one is not', () => {
+  // auth_ref names the authority a block acts under, and the check is whether that
+  // authority REACHES this block — covering the seq, and not cut off by a revocation that
+  // reaches it too. It is deliberately not "cite the newest grant": an owner writing a
+  // second, broader grant would then retroactively invalidate everything delivered under
+  // the first, and an owner being generous must not break the past.
+  const c = colony();
+  const g1 = c.grant(0);
+  const underOld = [0, 1].map(() => c.mw.push({ payload: Buffer.from('fine'), authRef: g1.hash }));
+  const g2 = c.grant(2);
+  const stillOld = c.mw.push({ payload: Buffer.from('old papers'), authRef: g1.hash }); // seq 2
+
+  const s = new Substrate();
+  load(s, [...c.blocks, g1, ...underOld, g2, stillOld]);
+  assert.equal(s.replica(c.M.logId.toString('hex')).linkedTo, 2,
+    'g1 was never revoked, so it still authorises');
+
+  // Now the same shape with a revocation in between — that one does cut it off.
+  const c2 = colony();
+  const h1 = c2.grant(0);
+  const ok2 = [0, 1].map(() => c2.mw.push({ payload: Buffer.from('fine'), authRef: h1.hash }));
+  const cut = c2.revoke(1);   // boundary 2, later in the owner's log than h1
+  const stale = c2.mw.push({ payload: Buffer.from('stale'), authRef: h1.hash }); // seq 2
+
+  const s2 = new Substrate();
+  load(s2, [...c2.blocks, h1, ...ok2, cut, stale]);
+  assert.equal(s2.replica(c2.M.logId.toString('hex')).linkedTo, 1,
+    'the revocation superseded the grant this block cites');
+  assert.equal(stale.seq, 2);
+});
+
+test('re-grant: nothing is authorised in a range the owner has not spoken about', () => {
+  // A member writing under a grant that begins at seq 4 has said nothing about seqs 0-3.
+  // That is a STALL, not a STOP: the owner may yet speak, and deciding against them now
+  // would make the answer depend on what has arrived rather than on what is true.
+  const c = colony();
+  const g = c.grant(4);
+  const tooEarly = c.mw.push({ payload: Buffer.from('jumping the gun'), authRef: g.hash });
+
+  const s = new Substrate();
+  load(s, [...c.blocks, g, tooEarly]);
+
+  const mr = s.replica(c.M.logId.toString('hex'));
+  assert.equal(mr.linkedTo, -1, 'nothing links');
+  assert.ok(mr.pendingDeps, 'and it is recorded as waiting, not as decided against');
+});
+
+test('re-grant: a restored member must cite the new grant, not the revoked one', () => {
+  // The case that falsification found missing. Governing alone does not catch it: after
+  // revoke-then-re-grant the entry governing the member's next seq is the NEW grant, so
+  // the block is in an authorised range — but it cites the grant the revocation cut off.
+  //
+  // If that were allowed, a revocation would mean nothing to anyone who kept a copy of the
+  // old grant's hash, which is everyone: it is a block, it replicates. Being let back in
+  // has to be acted on under the authority that let you back in.
+  const c = colony();
+  const g1 = c.grant(0);
+  const before = [0, 1].map(() => c.mw.push({ payload: Buffer.from('ok'), authRef: g1.hash }));
+  const rev = c.revoke(1);   // boundary 2, ownerSeq after g1
+  const g2 = c.grant(2);     // boundary 2, ownerSeq after the revocation — back in from 2
+  const stale = c.mw.push({ payload: Buffer.from('old papers'), authRef: g1.hash }); // seq 2
+
+  const s = new Substrate();
+  load(s, [...c.blocks, g1, ...before, rev, g2, stale]);
+  assert.equal(s.replica(c.M.logId.toString('hex')).linkedTo, 1,
+    'seq 2 is inside the re-granted range, but it cites the grant that was revoked');
+
+  // The same block, citing the new grant, is fine.
+  const d = colony();
+  const h1 = d.grant(0);
+  const okBefore = [0, 1].map(() => d.mw.push({ payload: Buffer.from('ok'), authRef: h1.hash }));
+  const cut = d.revoke(1);
+  const h2 = d.grant(2);
+  const proper = d.mw.push({ payload: Buffer.from('new papers'), authRef: h2.hash });
+
+  const s2 = new Substrate();
+  load(s2, [...d.blocks, h1, ...okBefore, cut, h2, proper]);
+  assert.equal(s2.replica(d.M.logId.toString('hex')).linkedTo, 2, 'restored, and acting like it');
+  assert.equal(proper.seq, 2);
+  assert.equal(okBefore.length, 2);
+  assert.ok(stale.seq === 2 && rev.seq < g2.seq);
 });

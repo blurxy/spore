@@ -1168,6 +1168,49 @@ spore, joins the colony, and sees it in its own glass, authenticated by the prot
 exists for exactly that. A spore holds a mesh identity and other people's traffic, and a
 debug surface that speaks HTTP to the network is the easiest thing in this repo to attack.
 
+**R6. Re-grant: `ROLE_GRANT` carries a pin too, and one ordered list replaces two rules.**
+
+SP1 had no way back in — a pin below your seq was permanent. Both control types now name a
+**boundary** in the target's log (a grant governs from `pin_seq`, a revocation from
+`pin_seq + 1`) and live in one ordered list per `(target, scope)`, sorted by boundary then
+by position in the owner's own log. The block governing any seq is the last boundary at or
+below it. That single lookup subsumes the pin scan it replaces; keeping both would have
+been two rules that can disagree.
+
+A design written before this and discarded: a grant's *effective* boundary as
+`max(pin_seq, k+1)` over every earlier revocation. It is subsumed by "largest boundary
+wins", and having both would have meant reconciling them forever.
+
+**V1 stays closed, and for free.** An owner who revoked at `k` and then re-grants at pin 0
+has not pardoned the replay at `k+1`: the revocation's boundary `k+1` is still the largest
+at or below `k+1`, so it still governs and still stops. Lifting a stop must be said out
+loud, with a pin at or above `k+1`, and the tie-break then hands it to the later block.
+Intent has to be written down; it cannot be arrived at by accident.
+
+Three things this costs, all recorded rather than fixed:
+
+1. **A member who wrote while revoked is out for good.** `linkedTo` is a contiguous
+   watermark over a single-writer hash chain, so a block that stops the frontier stops
+   everything above it — no later grant reaches past a hole, because a hole in a hash chain
+   cannot exist. Re-grant restores a member who stayed quiet. One who kept writing ended
+   their own log at the first unauthorised block, and their remedy is a new identity, which
+   is a new log. That is honest: the old log really does contain blocks nobody authorised.
+2. **The cited grant must be in force, not latest.** "Cite the newest grant" was written
+   first and is retroactively destructive — an owner writing a broader re-grant would
+   supersede the original *for seqs already delivered under it*, and history valid when it
+   arrived would stop. An owner being generous must not break the past. So the test is that
+   the cited grant covers this seq and no revocation reaching this seq superseded it.
+3. **A restored member must cite the new grant.** The corollary, and the one that
+   falsification caught missing: after revoke-then-re-grant the *governing* entry for the
+   member's next seq is the new grant, so a block citing the old one is inside an
+   authorised range. Allowing it would make a revocation meaningless to anyone holding the
+   old grant's hash — which is everyone, because it is a block and it replicates.
+
+`GRANT_LEN` moves 20 → 28, matching `REVOKE_LEN`. The SP1 wire break is free under R1. The
+two payloads now share a layout, so length no longer distinguishes them: the block **type**
+does, at header offset 1, inside the signed region. Length-sniffing was never the real
+defence; it worked by coincidence while the two differed.
+
 ## Open Decisions
 
 These require a human call; each has options and a recommendation, not a default.

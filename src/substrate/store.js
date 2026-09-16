@@ -368,7 +368,7 @@ export class Substrate extends EventEmitter {
     this.byHash = new Map();
     // Derived authority, rebuilt from the linked set — never accumulated incrementally,
     // because a retraction can withdraw a grant and an accumulator has no way to notice.
-    this.auth = { owners: new Map(), grants: new Map(), revokes: new Map() };
+    this.auth = { owners: new Map(), grants: new Map(), revokes: new Map(), rule: new Map() };
     this.authSig = null;
   }
 
@@ -471,8 +471,38 @@ export class Substrate extends EventEmitter {
     // other, yet their grant in the first would still authorise writes in the second.
     if (g.scope !== scope) return 'stop';
 
-    const pins = this.auth.revokes.get(replica.key);
-    if (pins) for (const pin of pins) if (pin.scope === scope && pin.pinSeq < seq) return 'stop';
+    // WHICH statement of the owner's governs THIS seq. The last boundary at or below it;
+    // ties to the later block in the owner's own log, so an owner who changes their mind
+    // has their latest word win without anything having to compare wall clocks.
+    const list = this.auth.rule.get(`${replica.key}|${scope}`);
+    let governing = null;
+    if (list) {
+      for (const e of list) {
+        if (e.boundary > seq) break; // sorted, so nothing after this can govern either
+        governing = e;
+      }
+    }
+    // The owner has said nothing that reaches this seq. STALL: they may yet, and deciding
+    // against the author now would make the answer depend on what has arrived.
+    if (!governing) return 'stall';
+    if (governing.kind === 'revoke') return 'stop';
+
+    // Governed by a grant. The cited one must be IN FORCE here — covering this seq, and
+    // not superseded by a revocation that reaches it — but it need not be the LATEST.
+    //
+    // "Cite the latest" was written first and is retroactively destructive: an owner who
+    // writes a forgiving re-grant at boundary 0 would supersede the original grant for
+    // seqs already delivered under it, and history that was valid when it arrived would
+    // stop. An owner being generous should not invalidate the past. V1 is closed by the
+    // revocation boundary, which is a statement about a RANGE, not by forcing every block
+    // to name the newest piece of paper.
+    const cited = list.find((e) => e.kind === 'grant' && e.hash === ref);
+    if (!cited) return 'stall';               // held, ours, but not yet chain-reachable
+    if (cited.boundary > seq) return 'stop';  // that grant does not reach this far back
+    for (const e of list) {
+      if (e.boundary > seq) break;
+      if (e.kind === 'revoke' && e.ownerSeq > cited.ownerSeq) return 'stop'; // superseded
+    }
     return 'ok';
   }
 
@@ -508,16 +538,30 @@ export class Substrate extends EventEmitter {
       }
     }
 
+    // Grants and revocations are the same kind of statement — "from this seq onward" — so
+    // they go in ONE list per (target, scope), ordered, and the block that governs a given
+    // seq is simply the last boundary at or below it. Two separate rules (a grant lookup
+    // and a pin scan) could disagree; one ordered list cannot.
     const revokes = new Map();
+    const rule = new Map();
+    const add = (target, scope, entry) => {
+      const k = `${target}|${scope}`;
+      const list = rule.get(k) || [];
+      list.push(entry);
+      rule.set(k, list);
+    };
+
     for (const p of pending) {
       const o = owners.get(p.scope);
       if (!o || o.key !== p.author) continue; // not the owner's word, so no power
       if (p.block.type === TYPE.ROLE_GRANT) {
         let g;
         try { g = decodeGrant(p.block.payload); } catch { continue; }
-        grants.set(p.block.hash.toString('hex'), {
-          owner: p.author, target: g.target.toString('hex'), scope: p.scope,
-        });
+        const hash = p.block.hash.toString('hex');
+        const target = g.target.toString('hex');
+        grants.set(hash, { owner: p.author, target, scope: p.scope });
+        // A grant governs FROM its pin.
+        add(target, p.scope, { boundary: Number(g.pinSeq), ownerSeq: p.seq, kind: 'grant', hash });
         continue;
       }
       let rv;
@@ -526,9 +570,20 @@ export class Substrate extends EventEmitter {
       const list = revokes.get(target) || [];
       list.push({ pinSeq: Number(rv.pinSeq), scope: p.scope });
       revokes.set(target, list);
+      // A revocation governs from ONE PAST its pin: the pin is the last seq it leaves
+      // alone. That single +1 is what keeps V1 closed under re-grant.
+      add(target, p.scope, { boundary: Number(rv.pinSeq) + 1, ownerSeq: p.seq, kind: 'revoke' });
     }
 
-    this.auth = { owners: new Map([...owners].map(([k, v]) => [k, v.key])), grants, revokes };
+    // Sorted by boundary, then by position in the OWNER'S log — which is the tie-break,
+    // and which is why ownerSeq has to come from the owner's log and not the member's.
+    for (const list of rule.values()) {
+      list.sort((a, b) => (a.boundary - b.boundary) || (a.ownerSeq - b.ownerSeq));
+    }
+
+    this.auth = {
+      owners: new Map([...owners].map(([k, v]) => [k, v.key])), grants, revokes, rule,
+    };
 
     // A signature of what was DERIVED, so a caller can tell a real authority change from a
     // stranger shouting into their own log. Sorted, so it is a function of the content and
@@ -536,10 +591,8 @@ export class Substrate extends EventEmitter {
     const parts = [];
     for (const [scope, o] of [...owners].sort()) parts.push(`o:${scope}:${o.key}`);
     for (const [h, g] of [...grants].sort()) parts.push(`g:${h}:${g.target}:${g.scope}`);
-    for (const [t, list] of [...revokes].sort()) {
-      for (const pin of list.slice().sort((a, b) => a.pinSeq - b.pinSeq)) {
-        parts.push(`r:${t}:${pin.scope}:${pin.pinSeq}`);
-      }
+    for (const [k, list] of [...rule].sort()) {
+      for (const e of list) parts.push(`${e.kind[0]}:${k}:${e.boundary}:${e.ownerSeq}`);
     }
     return parts.join('|');
   }
