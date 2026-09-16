@@ -248,6 +248,21 @@ test('property: replicas fed the same blocks in any order reach the same state',
       // in both cases is the liveness assertion above, which is the property the review's
       // fatal stall actually violated and which this test previously could not reach at
       // all, because it never ran with eviction on.
+      // The sanity envelope eviction cannot legitimately break. Under a tight budget the
+      // HELD set differs between arrival orders, so snapshots are not comparable — but a
+      // replica must never claim to have delivered something it does not hold, and must
+      // never reset below its own floor. Without this, tight seeds would assert liveness
+      // and nothing else, and a frontier that ran past the blocks behind it would pass.
+      for (const rep of s.logs.values()) {
+        const top = rep.blocks.size ? Math.max(...rep.blocks.keys()) : -1;
+        assert.ok(rep.linkedTo <= top,
+          `seed ${seed}: linkedTo ${rep.linkedTo} is past the highest block held (${top})`);
+        assert.ok(rep.orderedTo <= top,
+          `seed ${seed}: orderedTo ${rep.orderedTo} is past the highest block held (${top})`);
+        assert.ok(rep.linkedTo >= rep.floor - 1,
+          `seed ${seed}: linkedTo ${rep.linkedTo} is below the floor ${rep.floor}`);
+      }
+
       const snap = snapshot(s);
       if (tight) continue;
       if (reference === null) reference = snap;

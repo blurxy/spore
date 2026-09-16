@@ -21,13 +21,23 @@ not test the claim. Run both.
 
 ## Setup, per phone
 
+**See [`TERMUX.md`](TERMUX.md)** — getting to the point where you can run this is its own
+job, and it is the part nobody has done yet. It covers the F-Droid build, the wakelock
+(without which Android suspends a run mid-fetch and you measure its scheduler instead of
+the network), and moving the code with no git remote in the picture.
+
+The short version, once that is done:
+
 ```sh
-pkg update && pkg install nodejs-lts git
-git clone <your spore remote> && cd spore
-node --version     # must be 20+; 24 is what this was written against
+cd ~/spore
+node --version     # 20+; 24 is what this was written against
+npm test           # the version check that actually means something
 ```
 
 There is no `npm install`. There is nothing to install. That is the point.
+
+`bench/termux-bootstrap.sh` does the whole of that in one paste, for the second phone and
+the ones after it.
 
 ## The experiment
 
