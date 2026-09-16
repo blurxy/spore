@@ -108,13 +108,17 @@ class LogSync {
  *   'progress' { logId, held, total }
  */
 export class Syncer extends EventEmitter {
-  constructor({ substrate, hyphaManager, telemetry = null, selfPub, selfLogId }) {
+  constructor({ substrate, hyphaManager, telemetry = null, selfPub, selfLogId, requestTimeoutNs = REQUEST_TIMEOUT_NS }) {
     super();
     this.store = substrate;
     this.mgr = hyphaManager;
     this.tel = telemetry;
     this.selfPub = selfPub;
     this.selfLogId = selfLogId;
+    // How long this spore's patience lasts on one request. Injectable so a test can force
+    // the recovery path rather than waiting out the real value — a dropped frame is only
+    // recovered by this expiring, so a suite that never expires anything never tests it.
+    this.requestTimeoutNs = requestTimeoutNs;
 
     this.logs = new Map(); // logIdHex -> LogSync
     this.peerInflight = new Map(); // peerHex -> total outstanding across all logs
@@ -617,7 +621,7 @@ export class Syncer extends EventEmitter {
         byPeer.get(peerId).push(index);
         this.peerInflight.set(peerId, (this.peerInflight.get(peerId) || 0) + 1);
       }
-      const deadline = now + REQUEST_TIMEOUT_NS;
+      const deadline = now + this.requestTimeoutNs;
       for (const [peerHex, seqs] of byPeer) {
         const h = this.mgr.hyphae.get(peerHex);
         if (!h) {

@@ -332,8 +332,8 @@ export class Substrate extends EventEmitter {
       // The author signed two different blocks at the same seq. This is not a network
       // fault and not something a peer can fake — both signatures verify under the
       // author's own key. We keep what we had, record the proof, and surface it.
-      const retracted = this.#recordFork(r, seq, prior.hash, b.blockHash, prior.cert, cert);
-      return { ok: false, reason: 'equivocation', seq, retracted };
+      this.#recordFork(r, seq, prior.hash, b.blockHash, prior.cert, cert);
+      return { ok: false, reason: 'equivocation', seq };
     }
 
     const bytes = cert.length + payload.length;
@@ -385,29 +385,65 @@ export class Substrate extends EventEmitter {
    * A restore-from-backup equivocates innocently and is punished the same way. There is no
    * way to distinguish it from malice without a clock, and off-web there is no clock.
    */
+  /**
+   * Recompute every frontier from the bottom.
+   *
+   * A retraction does not stop at the log that forked. Another log may have linked a
+   * block whose dep pointed above the new fork point — it was linked on the strength of
+   * history this substrate has now withdrawn, so it has to be withdrawn too, and that can
+   * cascade again through anything citing IT.
+   *
+   * relink() cannot do this by itself: it only ever walks FORWARD from linkedTo, so it
+   * never re-examines a block it has already accepted. An earlier version of this file
+   * carried a comment claiming frontiers were "recomputed from scratch next time anything
+   * moves". They were not, and the result was order-dependent: whether a log ended up
+   * linked past a retracted dep depended entirely on whether the fork arrived before or
+   * after the citing block. Two honest replicas, same blocks, different answers. The
+   * property harness found it on its first run.
+   *
+   * Frontiers reset to `floor - 1` rather than -1, because everything below floor has been
+   * evicted. Those blocks were verified when they arrived and cannot be rechecked now;
+   * re-deriving them is neither possible nor necessary.
+   */
+  #recomputeAll() {
+    const before = new Map();
+    for (const r of this.logs.values()) {
+      before.set(r, r.linkedTo);
+      r.linkedTo = r.floor - 1;
+      r.pendingDeps = false;
+    }
+    const resolve = (h) => this.resolveDep(h);
+    for (;;) {
+      let moved = false;
+      for (const r of this.logs.values()) if (r.relink(resolve).length) moved = true;
+      if (!moved) break;
+    }
+    for (const [r, was] of before) {
+      if (r.linkedTo >= was) continue;
+      const seqs = [];
+      for (let x = was; x > r.linkedTo; x--) seqs.push(x);
+      this.tel?.count('substrate.retracted', seqs.length);
+      this.emit('retracted', { logId: r.logId, seqs: seqs.reverse() });
+    }
+  }
+
   #recordFork(r, seq, keptHash, otherHash, certA, certB) {
     if (!r.forks.has(seq)) {
       // The certs, not just the hashes. A fork proof is the two certificates — anyone can
       // verify it alone — and we cannot produce one later from a digest.
       r.forks.set(seq, { a: keptHash, b: otherHash, certA: Buffer.from(certA), certB: Buffer.from(certB) });
     }
-    const retracted = [];
-    if (seq < r.forkedAt) {
-      r.forkedAt = seq;
-      for (let x = r.linkedTo; x >= seq; x--) retracted.push(x);
-      r.linkedTo = Math.min(r.linkedTo, seq - 1);
-    }
+    const lowered = seq < r.forkedAt;
+    if (lowered) r.forkedAt = seq;
+
     this.tel?.count('substrate.equivocation');
     const f = r.forks.get(seq);
-    // a retraction can un-link blocks other logs' deps were relying on; their frontiers
-    // are recomputed from scratch next time anything moves, which relink() already does
-    // because it only ever walks forward from linkedTo.
     this.emit('equivocation', { logId: r.logId, seq, a: keptHash, b: otherHash, certA: f.certA, certB: f.certB });
-    if (retracted.length) {
-      this.tel?.count('substrate.retracted', retracted.length);
-      this.emit('retracted', { logId: r.logId, seqs: retracted.reverse() });
-    }
-    return retracted;
+
+    // Every frontier, not just this log's. A fork withdraws history other logs may have
+    // linked against, and that can cascade further. #recomputeAll emits the retractions.
+    if (lowered) this.#recomputeAll();
+    return lowered;
   }
 
   /**
