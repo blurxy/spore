@@ -92,7 +92,19 @@ export class Syncer extends EventEmitter {
     this.logs = new Map(); // logIdHex -> LogSync
     this.peerInflight = new Map(); // peerHex -> total outstanding across all logs
     this.timer = null;
-    this.stats = { requested: 0, served: 0, received: 0, noblock: 0, cancelled: 0, timedOut: 0, released: 0 };
+    // When true, no requests are issued. Serving continues normally — a paused spore is
+    // still a good citizen. The harness needs this because pump() is called directly from
+    // #recvHave and #recvHaveAdd, not only from the interval, so a joiner starts pulling
+    // the instant it meets its first source. Timing a fetch that began before the
+    // experiment did would report N sources and measure one.
+    this.paused = false;
+    // `fromPeer` is what separates a swarm from a download. If one peer served
+    // everything while three others sat present and idle, the speedup is not real and
+    // no aggregate number would show it.
+    this.stats = {
+      requested: 0, served: 0, received: 0, noblock: 0, cancelled: 0, timedOut: 0, released: 0,
+      fromPeer: new Map(),
+    };
 
     // Forks we have already told the mesh about, keyed `logHex:seq`. Bounded by the
     // number of distinct forks that actually exist, which only an author can create.
@@ -398,6 +410,7 @@ export class Syncer extends EventEmitter {
       return;
     }
     if (!res.duplicate) {
+      this.stats.fromPeer.set(peer, (this.stats.fromPeer.get(peer) || 0) + 1);
       this.announce(cert.subarray(4, 20), seq);
       // Endgame may have asked several peers for this. Tell the losers to stop.
       if (l) this.#cancelOthers(l, peer, seq);
@@ -496,6 +509,7 @@ export class Syncer extends EventEmitter {
   pump() {
     const now = process.hrtime.bigint();
     this.#sweepDeadlines(now);
+    if (this.paused) return;
 
     for (const l of this.logs.values()) {
       if (!l.peers.size) continue;
