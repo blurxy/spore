@@ -881,6 +881,47 @@ rather than projected:
    `INDEX_SEGMENT` only, at N ∈ {1,2,5,10,20}. Falsifiers as stated in `design-roles.md` §7
    plus the CPU-cap falsifier from §1.6.
 
+## Resolved Decisions
+
+Decisions taken since the reconciliation pass. Each closes an entry below or a question the
+SP2 encryption design raised.
+
+**R1. SP1 colonies do not carry forward to SP2. Compatibility is broken deliberately.**
+
+`ENCRYPTION.md` surfaced a migration problem: SP1 `MEMBER_JOIN` blocks predate `wrap_pub_c`,
+so existing members cannot be wrapped into an epoch without a migration block and a dual-mode
+read path that tolerates both plaintext and encrypted blocks during the transition.
+
+We are not building that. Open Decision 2 was already resolved in favour of (b) — SP1 is an
+internal milestone that proves scaling and mesh mechanics, not a release. Its logs contain
+benchmark traffic and `pulse` messages. Building a migration path to preserve data that was
+never intended to survive is speculative groundwork of exactly the kind that rots: it would
+add a permanent dual-mode branch to the block verifier, and the branch's only user is data
+nobody wants.
+
+Consequence, stated plainly: **an SP1 colony cannot be upgraded. It is re-founded.** A spore
+running SP2 refuses an SP1 genesis outright rather than reading it in a degraded mode, because
+a reader that accepts unencrypted blocks is an attack surface that outlives the reason it was
+added. `wire_version` is the gate and it is already in the HELLO datagram at offset 4.
+
+This also removes step 0 from `ENCRYPTION.md`'s 12-step sequence: there is no migration block,
+no `wrap_pub_c` backfill, and no dual-mode verifier. `MEMBER_JOIN` simply gains a required
+`wrap_pub_c` field in SP2, which is the version where it first exists.
+
+**R2. Indefinite partition: the mesh renders its own doubt.** See `docs/PARTITION.md`. The
+limitation named in `ENCRYPTION.md` §3 is unsolvable and is not solved. It is made visible
+instead — member fade bound to causal distance (`own_lamport − last_seen_lamport`), never to
+a clock — and rotation is offered as a gesture on what the human can see, never as a
+permission dialog. Implement with SP2 rotation; there is nothing to rotate before then.
+
+**R3. Hardware target is phones, and the mesh path is Android first.** iOS multicast requires
+`com.apple.developer.networking.multicast`, which Apple grants selectively by application —
+it is not something that can be written blind. Android's `MulticastLock` is unprivileged. So
+the SP3 target is: Android carries the mesh; iOS ships as a client onto an Android or laptop
+mesh until the entitlement exists. The Braille subpixel renderer does not map to a
+touchscreen and needs a canvas path, but the telemetry bus underneath it is already the right
+shape and is reused unchanged — every growth stays bound to the same measured quantity.
+
 ## Open Decisions
 
 These require a human call; each has options and a recommendation, not a default.
