@@ -4,32 +4,20 @@
 // The signature covers payload_hash, not the payload, so a 40MB video block is still a
 // 260-byte cert that SHARDING can fetch and verify independently of its bytes.
 
-import { createHash, sign as edSign, verify as edVerify, randomBytes } from 'node:crypto';
+import { sign as edSign, verify as edVerify, randomBytes } from 'node:crypto';
+import { blake2b256 } from './blake2b.js';
 
 export const HEADER_LEN = 196;
 export const SIG_LEN = 64;
 export const DEP_LEN = 32;
 
-// ---------------------------------------------------------------------------
-// DEVIATION FROM SPEC, DELIBERATE AND LOAD-BEARING
-//
-// design-substrate.md specifies BLAKE2b-256. Node 24 exposes only blake2b512 and
-// blake2s256 — there is no parameterized-output BLAKE2b. We therefore use
-// BLAKE2b-512 truncated to 32 bytes.
-//
-// This is a secure 256-bit hash, but it is NOT the same function as BLAKE2b-256:
-// BLAKE2b parameterizes its IV with the digest length, so real BLAKE2b-256 produces
-// different bytes for the same input. A second SPORE implementation written from the
-// spec alone would compute different block_hashes and fail to interop.
-//
-// Recorded here rather than fixed silently. Options at SP2: amend the spec to say
-// "BLAKE2b-512 truncated", or ship a ~120-line BLAKE2b core to get true 256.
-// ---------------------------------------------------------------------------
-export function hash256(...parts) {
-  const h = createHash('blake2b512');
-  for (const p of parts) h.update(p);
-  return h.digest().subarray(0, 32);
-}
+// Real BLAKE2b-256 exactly as design-substrate.md specifies — not blake2b512 truncated.
+// Node ships no parameterized-output BLAKE2b, so src/substrate/blake2b.js implements
+// RFC 7693 properly, with the digest length mixed into h[0] where it belongs. That
+// distinction is not cosmetic: truncated-512 and real-256 produce entirely different
+// bytes, so getting this wrong would have silently guaranteed that no second SPORE
+// implementation written from the spec could ever interop with this one.
+export const hash256 = blake2b256;
 
 export const TYPE = {
   IDENTITY: 0x01,
