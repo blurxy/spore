@@ -51,3 +51,42 @@ visibly lag over SSH and to stress even a local terminal emulator.
 
 The 66x CPU headroom is what buys the simulation-driven aesthetic: there is room to run a
 real growth simulation every frame rather than replaying canned animations.
+
+## Probe 3 — `probe-diff.mjs`: differential dirty-cell rendering
+
+**Question:** probe 2 found naive full repaint costs 576 KB/s at 60fps, which would lag over
+SSH. Does dirty-cell diffing actually fix it, and what does the diffing itself cost?
+
+**Method:** identical growth simulation and canvas. Each frame emits only cells whose glyph
+or colour changed, coalescing adjacent runs, reusing the active SGR colour across runs, and
+wrapping the frame in synchronized output mode (`CSI ?2026h` / `CSI ?2026l`).
+
+**Result: PASS.**
+
+| | bytes/frame | at 60fps |
+|---|---|---|
+| full repaint | 9,824 | 576 KB/s |
+| **differential** | **1,365** | **80 KB/s** |
+| reduction | **7.2x** | |
+
+Diffing costs 0.012 ms/frame — about 5% of the 0.25 ms simulation budget, and 0.07% of the
+16.67 ms frame budget. It is nearly free.
+
+**Conclusion:** the zero-dependency ANSI path is viable for continuous growth animation even
+over a remote shell. Adopted into the design as mandatory:
+
+1. Double-buffered glyph + colour planes, diffed per frame.
+2. Runs sharing an SGR colour coalesce into one escape sequence.
+3. Cursor repositioning only when the run is discontinuous.
+4. Every frame wrapped in synchronized output mode to prevent tearing.
+
+## Summary
+
+Three probes, three passes, two findings that materially changed the architecture:
+
+- BEACON must tolerate per-interface multicast join failures (Windows `EINVAL`).
+- Differential rendering is a requirement, not an optimization (7.2x byte reduction).
+
+The 66x CPU headroom from probe 2 combined with the 7.2x byte reduction here is what makes a
+genuinely simulation-driven interface affordable: SPORE can run real growth physics every
+frame instead of replaying canned animation, in a plain terminal, with zero dependencies.
