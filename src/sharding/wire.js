@@ -56,6 +56,20 @@ const LOG_ID = 16;
 const PUB = 32;
 const PAIR = LOG_ID + 4; // (log_id, seq)
 
+/**
+ * The largest seq that may arrive on the wire. 2^24 = 16,777,216 blocks in one log.
+ *
+ * seq is a u32, and a receiver sizes a bitfield from it — so without this bound a peer
+ * sends 23 well-formed bytes claiming a block at 4,294,967,295 and the receiver allocates
+ * a 512 MB Uint8Array. On a phone that is not a slowdown, it is the process.
+ *
+ * The bound lives in the DECODER rather than at each use site, because there is no
+ * correct thing for a caller to do with a number this large and only one place to forget
+ * the check. 16M blocks at the 32 KB the harness uses is half a terabyte in one log; a
+ * log that long has other problems first, and the bitfield costs 2 MB.
+ */
+export const MAX_SEQ = 0xffffff;
+
 export class WireError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
@@ -97,6 +111,8 @@ export function decodeHave(body) {
     const logId = body.subarray(o, o + LOG_ID);
     const authorPub = body.subarray(o + LOG_ID, o + LOG_ID + PUB);
     const bitlen = body.readUInt32LE(o + LOG_ID + PUB);
+    // Same reason as MAX_SEQ: bitlen sizes an allocation on the receiving side.
+    if (bitlen > MAX_SEQ + 1) throw new WireError('bitlen_out_of_range');
     o += LOG_ID + PUB + 4;
     const nbytes = Math.ceil(bitlen / 8);
     if (o + nbytes > body.length) throw new WireError('have_bits_truncated');
@@ -128,7 +144,9 @@ export function decodePairs(body) {
   const out = [];
   for (let i = 0; i < n; i++) {
     const o = 3 + i * PAIR;
-    out.push({ logId: body.subarray(o, o + LOG_ID), seq: body.readUInt32LE(o + LOG_ID) });
+    const seq = body.readUInt32LE(o + LOG_ID);
+    if (seq > MAX_SEQ) throw new WireError('seq_out_of_range');
+    out.push({ logId: body.subarray(o, o + LOG_ID), seq });
   }
   return out;
 }

@@ -41,6 +41,20 @@ import {
 import { CERT_MIN } from '../substrate/store.js';
 
 export const MAX_INFLIGHT_PER_PEER = 6;
+
+/**
+ * The most logs one spore will track for peers.
+ *
+ * Nothing authorises a log into existence — any authenticated peer can name one in a
+ * HAVE or HAVE_ADD and we create state for it. Unbounded, that is a memory leak with a
+ * wire interface: ~65,000 logs in a few frames, each with its own scheduler, peer map and
+ * bitfields. It also overflows the u16 log count in encodeHave, at which point our own
+ * advertisements start lying.
+ *
+ * Logs we hold blocks for are never evicted by this; the cap only refuses to start
+ * tracking NEW ones a peer merely claims. A real colony sits far below it.
+ */
+export const MAX_LOGS = 256;
 export const REQUEST_TIMEOUT_NS = 8_000_000_000n; // 8s of local patience
 const PUMP_MS = 25;
 
@@ -154,10 +168,15 @@ export class Syncer extends EventEmitter {
     this.timer = null;
   }
 
+  /** Get or start tracking a log. Returns null once the cap is reached. */
   #log(logId, authorPub) {
     const key = Buffer.from(logId).toString('hex');
     let l = this.logs.get(key);
     if (!l) {
+      if (this.logs.size >= MAX_LOGS) {
+        this.tel?.count('sync.log_cap_reached');
+        return null;
+      }
       l = new LogSync(logId, authorPub);
       this.logs.set(key, l);
     } else if (!l.authorPub && authorPub) {
@@ -313,6 +332,7 @@ export class Syncer extends EventEmitter {
   #recvHave(peer, body) {
     for (const e of decodeHave(body)) {
       const l = this.#log(e.logId, e.authorPub);
+      if (!l) continue; // at the log cap; we simply do not learn about this one
       l.peers.set(peer, {
         have: bitfieldFrom(e.bitlen, e.bits),
         inflight: l.peers.get(peer)?.inflight || new Set(),
@@ -343,6 +363,7 @@ export class Syncer extends EventEmitter {
   #recvHaveAdd(peer, body) {
     for (const { logId, seq } of decodePairs(body)) {
       const l = this.#log(logId, null);
+      if (!l) continue; // at the log cap
       let p = l.peers.get(peer);
       if (!p) {
         p = { have: new Bitfield(seq + 1), inflight: new Set(), maxInflight: MAX_INFLIGHT_PER_PEER };

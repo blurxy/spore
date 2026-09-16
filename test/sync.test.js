@@ -9,8 +9,9 @@ import { Syncer } from '../src/sharding/sync.js';
 import { Telemetry } from '../src/telemetry/bus.js';
 import {
   MSG, encodeHave, decodeHave, encodePairs, decodePairs,
-  encodeBlockMsg, decodeBlockMsg, MAX_BODY,
+  encodeBlockMsg, decodeBlockMsg, MAX_BODY, MAX_SEQ, WireError,
 } from '../src/sharding/wire.js';
+import { MAX_LOGS } from '../src/sharding/sync.js';
 
 // --- helpers ------------------------------------------------------------------------
 
@@ -100,6 +101,28 @@ test('wire: pair lists round-trip and are capped to one frame, never overflowing
   assert.equal(back[0].seq, 0);
   assert.equal(back.at(-1).seq, back.length - 1);
   assert.ok(back[7].logId.equals(id.logId));
+});
+
+test('wire: a seq above MAX_SEQ is refused before anything is sized from it', () => {
+  // seq arrives as a raw u32. Sizing an allocation from it means a 23-byte frame can ask
+  // for a 512 MB Uint8Array — on a phone that is the process. The bound has to sit in the
+  // decoder, before any caller can be tempted to trust the number.
+  const id = identity();
+  const body = Buffer.alloc(3 + 20);
+  body.writeUInt8(MSG.HAVE_ADD, 0);
+  body.writeUInt16LE(1, 1);
+  id.logId.copy(body, 3);
+  body.writeUInt32LE(0xffffffff, 19);
+
+  assert.throws(() => decodePairs(body), (e) => e instanceof WireError && e.code === 'seq_out_of_range');
+
+  // and the boundary is exactly where it says it is
+  const ok = Buffer.from(body);
+  ok.writeUInt32LE(MAX_SEQ, 19);
+  assert.equal(decodePairs(ok)[0].seq, MAX_SEQ, 'MAX_SEQ itself is legal');
+  const bad = Buffer.from(body);
+  bad.writeUInt32LE(MAX_SEQ + 1, 19);
+  assert.throws(() => decodePairs(bad), /seq_out_of_range/);
 });
 
 test('wire: BLOCK carries the author key alongside the cert', () => {
@@ -374,6 +397,62 @@ test('store: a random log id has no author and is refused', () => {
 });
 
 // --- real transfer over real sockets -------------------------------------------------
+
+test('sync: a hostile HAVE_ADD cannot make a spore allocate, and kills the hypha', async () => {
+  const victim = spore(47670);
+  const hostile = spore(47671);
+  for (const s of [victim, hostile]) await s.mgr.listen();
+  victim.sync.start();
+
+  const h = await hostile.mgr.dial({ sporeId: victim.id.pub, addrs: ['127.0.0.1'], tcpPort: 47670 });
+  assert.ok(h, 'dial must succeed');
+
+  const before = process.memoryUsage().heapTotal;
+  const closed = new Promise((res) => h.once('close', res));
+
+  // One 23-byte frame claiming a block at seq 2^32-1. Well-formed by every length check;
+  // the only thing wrong with it is the number.
+  const body = Buffer.alloc(23);
+  body.writeUInt8(MSG.HAVE_ADD, 0);
+  body.writeUInt16LE(1, 1);
+  Buffer.alloc(16, 0xab).copy(body, 3);
+  body.writeUInt32LE(0xffffffff, 19);
+  h.send(body);
+
+  await closed; // a protocol violation from an authenticated peer ends the hypha
+  const grew = (process.memoryUsage().heapTotal - before) / 1048576;
+  assert.ok(grew < 64, `victim heap grew ${grew.toFixed(1)} MB from a 23-byte frame`);
+  assert.equal(victim.sync.logs.size, 0, 'and no state was created for the claimed log');
+
+  victim.sync.stop();
+  await victim.mgr.stop(); await hostile.mgr.stop();
+});
+
+test('sync: a log flood is capped rather than tracked forever', async () => {
+  const victim = spore(47672);
+  const hostile = spore(47673);
+  for (const s of [victim, hostile]) await s.mgr.listen();
+  victim.sync.start();
+
+  const h = await hostile.mgr.dial({ sporeId: victim.id.pub, addrs: ['127.0.0.1'], tcpPort: 47672 });
+
+  // Nothing authorises a log into existence — any peer can name one. Unbounded, that is
+  // a memory leak with a wire interface, and it also overflows the u16 log count in HAVE.
+  const pairs = [];
+  for (let i = 0; i < MAX_LOGS + 200; i++) {
+    const logId = Buffer.alloc(16);
+    logId.writeUInt32LE(i, 0);
+    pairs.push({ logId, seq: 0 });
+  }
+  h.send(encodePairs(MSG.HAVE_ADD, pairs));
+
+  await until(() => victim.sync.logs.size >= MAX_LOGS, 4000);
+  await settle(200);
+  assert.ok(victim.sync.logs.size <= MAX_LOGS, `tracked ${victim.sync.logs.size} logs, cap is ${MAX_LOGS}`);
+
+  victim.sync.stop();
+  await victim.mgr.stop(); await hostile.mgr.stop();
+});
 
 test('sync: a joiner pulls a whole backlog over real hyphae and links every block', async () => {
   const author = identity();

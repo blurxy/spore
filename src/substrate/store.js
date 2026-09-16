@@ -34,6 +34,16 @@ import { Bitfield } from '../sharding/scheduler.js';
 export const CERT_MIN = HEADER_LEN + SIG_LEN;
 
 /**
+ * The most logs one substrate will hold.
+ *
+ * Membership does not gate log creation in SP1: any block whose signature verifies under
+ * a key matching its log_id opens a replica, and anyone can mint keys for free. Without a
+ * cap a peer can make a spore track unbounded logs, each carrying its blocks and
+ * bitfields. Matches sync.js MAX_LOGS deliberately — one number, one meaning.
+ */
+export const MAX_LOGS = 256;
+
+/**
  * One author's log, as far as this spore has it.
  *
  * `authorPub` is not taken on trust. It is checked against log_id on first sight
@@ -133,6 +143,10 @@ export class Substrate extends EventEmitter {
     if (existing) return existing;
     if (!logIdMatches(logId, authorPub)) {
       this.tel?.count('substrate.reject.log_author_mismatch');
+      return null;
+    }
+    if (this.logs.size >= MAX_LOGS) {
+      this.tel?.count('substrate.log_cap_reached');
       return null;
     }
     const r = new LogReplica(logId, authorPub);
