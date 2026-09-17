@@ -1288,9 +1288,15 @@ before it compares them, as `sync.js` does at every hypha setup.
 **What is not closed, and is not mine to claim closed.** The advisor pass that produced this
 design ran a wider sweep than the suite does — 300 seeds across three budgets, fresh plus four
 tight shuffles — and reported 248 of 900 worlds diverging before these changes and 38 after,
-every remaining one on `orderedTo` and none on delivery. That sweep was run on a separate copy
-and **has not been reproduced here**; the committed suite is 116 green at 60 seeds, which is a
-weaker statement. The shape it describes is a citer that was ordered, evicted, and whose dep a
+every remaining one on `orderedTo` and none on delivery. That sweep ran on a separate copy, and it has since been
+reproduced here independently. A widened harness at 300 worlds with **every** seed tight — the
+committed suite makes only one seed in three tight — diverges on 12, which is 4.0% against the
+advisor pass's 4.2%, and **every one of the twelve is an ordering divergence, with zero
+delivery-only cases**. A first attempt at classifying them reported the opposite and was wrong:
+`linkedTo <= orderedTo` holds by construction, so an ordering divergence drags delivery down
+with it, and counting that as a delivery fault reports one fault as two. The committed suite is
+116 green at 60 seeds, which is a weaker statement than the sweep and is the one the suite
+actually defends. The shape it describes is a citer that was ordered, evicted, and whose dep a
 later fork in another log withdrew. One instance of that shape — seed 48 — is fixed, because
 `lost` now carries the seq and reports a retraction instead of laundering it. Whether others
 survive is open. The witness for that class is the dep list, which is the block header, and

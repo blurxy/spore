@@ -6,3 +6,6 @@ bench/out/
 # Agent worktrees created by Claude Code workflow isolation. Live checkouts may be
 # in here while a review runs — never git clean this directory.
 .claude/worktrees/
+
+# Scratch sweeps: widened copies of the property harness, never committed.
+test/zz-*.test.js
