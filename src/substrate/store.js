@@ -106,7 +106,26 @@ export const CLAIMS_CAP = 256;
  * unknown dep may still arrive, a retracted one never becomes valid again.
  */
 const RETRACTED = Symbol('retracted');
-const KEEP_FOREVER = AUTHORITY;
+// A SEPARATE SET, deliberately, though it holds the same three types today.
+//
+// These answer two different questions. AUTHORITY is what #rebuildAuth DERIVES FROM — add a
+// type here and the substrate starts computing permissions from it. KEEP_FOREVER is what
+// survives the byte budget. They coincide now only because the three types that carry
+// authority happen to also be the three that must not be forgotten.
+//
+// SP2 breaks the coincidence. MEMBER_JOIN / MEMBER_LEAVE / MEMBER_BAN / FRUITING_CREATE are
+// evictable today and nothing reads them for authority, but SP2's wrap-set check, eligibility,
+// and KEYBUNDLE entitlement all will — and R4b's laundering argument applies to them verbatim:
+// forget a ban and the exclusion goes with it. They must become KEEP_FOREVER WITHOUT becoming
+// AUTHORITY, or #rebuildAuth would begin deriving permissions from block types whose payloads
+// it has never validated.
+//
+// While these were one object that distinction was unstatable: a single `.add()` would have
+// done both, silently, and the failure mode is a permission system quietly widening. No test
+// defends this split, because any test would assert that a constant equals itself — the
+// defence is this comment and the decision record, said plainly rather than left to look
+// load-bearing.
+const KEEP_FOREVER = new Set(AUTHORITY);
 
 /**
  * Would #rebuildAuth actually COUNT this block?
