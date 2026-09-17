@@ -828,6 +828,14 @@ export class Substrate extends EventEmitter {
     const seq = Number(d.seq);
     if (!Number.isSafeInteger(seq) || seq < 0 || seq > MAX_SEQ) return { ok: false, reason: 'seq_range' };
 
+    // deps NAME LOGS whose head this block advanced past, and a spore tracks at most
+    // MAX_LOGS of them. A block claiming more is claiming something that cannot be true —
+    // and dep_count is a u16, so without this a cert reaches ~64 KB while carrying a
+    // perfectly well-formed authority payload, which is retained forever and which the
+    // payload-shape check cannot see because the payload is fine. Same funnel and same
+    // argument as MAX_SEQ: enforce where the field sizes something, ahead of any allocation.
+    if (d.deps.length > MAX_LOGS) return { ok: false, reason: 'dep_count' };
+
     const r = this.ensure(d.logId, authorPub);
     if (!r) return { ok: false, reason: 'log_author_mismatch' };
 

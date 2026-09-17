@@ -1066,3 +1066,52 @@ test('store: the forgotten-lamport witness is capped, oldest out', () => {
   assert.ok(!r.lost.has(hashOf(blocks[0])), 'the oldest witness was dropped');
   assert.ok(r.lost.has(hashOf(blocks[n - 20])), 'a recent one was kept');
 });
+
+test('store: a block naming more deps than there are logs is refused', () => {
+  // dep_count is a u16 and was capped nowhere. MAX_BODY bounds it to ~2036 deps on the wire,
+  // which is still a ~64 KB CERT — and a cert is not a payload, so the retention shape check
+  // does not see it. Typed ROLE_GRANT with a well-formed 28-byte payload, it is real
+  // authority by every test the substrate applies, and unevictable at 224x the cost R4b
+  // budgets for.
+  //
+  // The bound is principled rather than arbitrary, which is the only kind worth adding: deps
+  // name logs whose head this block advanced past, and a spore tracks at most MAX_LOGS logs
+  // (store.js says "one number, one meaning"). A block claiming more deps than there are
+  // logs to depend on is claiming something that cannot be true.
+  //
+  // Same funnel and same argument as MAX_SEQ: enforce where the field SIZES something, at
+  // insert(), ahead of ensure(), because a bound checked on one transport is a bound the
+  // next transport silently loses.
+  const id = identity();
+  const deps = Array.from({ length: MAX_LOGS + 1 }, (_, i) => {
+    const b = Buffer.alloc(32);
+    b.writeUInt32LE(i + 1, 0);
+    return b;
+  });
+  const { cert } = encodeBlock(
+    {
+      type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq: 0,
+      lamport: 1n, prevHash: Buffer.alloc(32), payload: Buffer.alloc(0), deps,
+    },
+    id.kp.privateKey,
+  );
+
+  const store = new Substrate();
+  const res = store.insert(cert, Buffer.alloc(0), id.pub);
+  assert.equal(res.ok, false, `${MAX_LOGS + 1} deps must be refused`);
+  assert.equal(res.reason, 'dep_count');
+  assert.equal(store.logs.size, 0, 'and no replica is created for it');
+
+  // The bound itself is legal — a ceiling, not an off-by-one.
+  const okDeps = deps.slice(0, MAX_LOGS);
+  const { cert: okCert } = encodeBlock(
+    {
+      type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq: 0,
+      lamport: 1n, prevHash: Buffer.alloc(32), payload: Buffer.alloc(0), deps: okDeps,
+    },
+    id.kp.privateKey,
+  );
+  const s2 = new Substrate();
+  assert.notEqual(s2.insert(okCert, Buffer.alloc(0), id.pub).reason, 'dep_count',
+    'exactly MAX_LOGS deps is legal');
+});
