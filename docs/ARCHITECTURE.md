@@ -1272,6 +1272,40 @@ rule list. It is a regression oracle, not a discovery oracle: it catches a CONSU
 diverging from the rule the PRODUCER built, which is what this bug was. If R6 itself is
 wrong, both readings are wrong together and it stays silent.
 
+**R8. A fork proof is evidence of one fact, so one is kept — and a proof that moves nothing
+is free.** The last of the second round’s fatal findings, and the sharpest instance yet of
+this repo’s failure shape: not a bound stated in a comment rather than enforced, but a
+comment that misdescribed the line beside it. `this.forks` was declared “seq -> { kept,
+other } block hashes” and stored two full certificates — ~520 bytes an entry against the 64
+the comment implied, an 8x undercount that is presumably why nobody costed it. Nothing
+bounded the map: `#trim` and `forgetOldest` touch only `r.blocks` and `r.bytes`, so
+`maxBytes` never saw it however tight it was set, and `acceptForkProof` reached it without
+paying the ordinary block-storage path at all.
+
+The CPU half was worse and is the part that matters. `#recordFork` forced
+`#resolveFrontiers(true)`, and `force` exists precisely to bypass R4f’s refusal to rewalk
+when derived authority is byte-identical. Its gate was `lowered` — a condition the attacker
+chooses. Proofs in DESCENDING seq order are each lower than the last, so every one bought a
+full substrate-wide rewalk while nothing could possibly have moved: R4f’s own DoS, reopened
+one function over, through a door `sync.js` holds open to anyone with no rate limit and then
+replays to every new hypha. **The gate is now whether a frontier or the floor actually
+shifted.** A fork above everything held retracts nothing and costs nothing; a fork that
+genuinely invalidates held history still pays, because that work is real. The test asserts
+both directions, so the fix cannot have been bought by refusing real work.
+
+A log that forked at 3 has ended at 3, so only the lowest proof is retained, and
+`acceptForkProof` now treats `seq >= forkedAt` as a duplicate — cheaper and stronger than
+asking the map for one exact seq.
+
+`#recordFork`’s floor clamp is deliberately untouched. **That** clamp is R4e’s and is sound:
+a fork ends chain, ordering and delivery together, so lowering the floor to it strands
+nothing orderable. R7’s revocation clamp copied R4e’s sentence “with one word changed”, and
+that is exactly where it went wrong, because a revocation ends delivery only. The asymmetry
+between the two is the argument for revisiting R7, and R7’s stated reason for rejecting the
+`linkedTo` bound — “a revoked log stops being evictable” — does not survive contact with it:
+after the shipped clamp, `forgetOldest` iterates `[stop, stop - 1)`, which is empty too. The
+objection never discriminated between the two designs. The real difference is `orderedTo`.
+
 ## Open Decisions
 
 These require a human call; each has options and a recommendation, not a default.
