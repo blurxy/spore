@@ -1318,6 +1318,20 @@ rule list. It is a regression oracle, not a discovery oracle: it catches a CONSU
 diverging from the rule the PRODUCER built, which is what this bug was. If R6 itself is
 wrong, both readings are wrong together and it stays silent.
 
+**R9. The first hardware measurement may be measuring us, not the radio.** `docs/RESULTS-2026-09-17.md`
+records SPORE running on an Android tablet: 119/119 unmodified, multicast discovery working,
+and one source delivering 7.5–13.7 MB/s. The throughput figure is now caveated in place and the
+interpretation drawn from it — that §3.1's uplink constant is merely pessimistic — is withdrawn.
+
+`MAX_INFLIGHT_PER_PEER` is 6 and a BLOCK is 33,100 bytes on the wire, so at most 198,600 bytes
+are outstanding to one source. At the measured 9 ms RTT that caps a single source at 21.0 MiB/s;
+at the 17 ms max, 11.1. Every measured value falls inside that ceiling, and the ~1.8x
+run-to-run variance is what RTT jitter against a fixed window produces. `bench/curve.js` models
+`RTT_MS = 3`, where the bound sits at ~63 MiB/s — so **the simulation could not exhibit the
+limit the hardware may have been hitting, and the two agreed while measuring different
+quantities.** That is the worst way for two numbers to agree, and it is worth recording as a
+method failure rather than only as a number to fix.
+
 **R8. A fork proof is evidence of one fact, so one is kept — and a proof that moves nothing
 is free.** The last of the second round’s fatal findings, and the sharpest instance yet of
 this repo’s failure shape: not a bound stated in a comment rather than enforced, but a
