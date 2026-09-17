@@ -237,6 +237,24 @@ import { hash256 } from '../src/substrate/store.js';
 const require_hash = (b) => hash256(b.cert);
 
 /** The comparable state of a substrate: what two honest replicas must agree on. */
+/**
+ * The frontiers alone — no held set. Comparable across arrival orders even under a tight
+ * budget, for the reason above: forgetting is meant to be invisible to derivation.
+ */
+function frontiers(s) {
+  const out = [];
+  for (const [key, r] of [...s.logs].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    out.push({
+      key,
+      chainTo: r.chainTo,
+      orderedTo: r.orderedTo,
+      linkedTo: r.linkedTo,
+      forkedAt: r.forkedAt === Infinity ? -1 : r.forkedAt,
+    });
+  }
+  return JSON.stringify(out);
+}
+
 function snapshot(s) {
   const out = [];
   for (const [key, r] of [...s.logs].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
@@ -285,6 +303,7 @@ test('property: replicas fed the same blocks in any order reach the same state',
     const each = world.blocks[0].cert.length + world.blocks[0].payload.length;
 
     let reference = null;
+    let refFront = null;
     for (let k = 0; k < 4; k++) {
       const s = new Substrate({ maxBytes: tight ? each * 8 : 1 << 30 });
       for (const b of shuffled(rng(seed * 100 + k), world.blocks)) {
@@ -325,10 +344,43 @@ test('property: replicas fed the same blocks in any order reach the same state',
           `seed ${seed}: linkedTo ${rep.linkedTo} is past the highest block held (${top})`);
         assert.ok(rep.orderedTo <= top,
           `seed ${seed}: orderedTo ${rep.orderedTo} is past the highest block held (${top})`);
-        assert.ok(rep.linkedTo >= rep.floor - 1,
-          `seed ${seed}: linkedTo ${rep.linkedTo} is below the floor ${rep.floor}`);
+        // NOT `linkedTo >= floor - 1`, which this used to assert and which is wrong —
+        // wrong on principle, not merely in the way of a patch.
+        //
+        // It said "delivery below the floor is final". The substrate contradicts that in
+        // two places of its own: the `retracted` event exists precisely to withdraw
+        // delivery after the fact, and the V1 fix stops blocks retroactively. R4e's whole
+        // point is that verdicts below the floor get re-asked — floorHash, floorLamport,
+        // `lost` and now `claims` are the witnesses kept SO THAT they can be.
+        //
+        // It is also incompatible with convergence, which is the property this file is
+        // about. A fresh replica facing a revocation at boundary B settles at
+        // linkedTo = B - 1 forever. A replica that evicted past B has floor > B. For the
+        // two to agree — and they must, they hold the same blocks — the tight one needs
+        // linkedTo = B - 1, which is below floor - 1. The old assertion could only be
+        // satisfied by dragging the floor down to B, which is what R7 originally did and
+        // what cost ordering.
+        //
+        // The floor bounds ORDERING, which is what its witness serves: walk one chains
+        // against floorHash at s === floor. Delivery is a sub-range of ordering by
+        // construction, because walk two only ever visits what walk one ordered.
+        assert.ok(rep.orderedTo >= rep.floor - 1,
+          `seed ${seed}: orderedTo ${rep.orderedTo} is below the floor ${rep.floor}`);
+        assert.ok(rep.linkedTo <= rep.orderedTo,
+          `seed ${seed}: linkedTo ${rep.linkedTo} is above orderedTo ${rep.orderedTo}`);
       }
 
+      // FRONTIERS ALWAYS, held sets only when eviction is off.
+      //
+      // Which blocks a replica HOLDS legitimately differs with arrival order under a tight
+      // budget — which replica was fattest when the budget bit decides what it forgot, and
+      // that is by design. The frontiers are a different matter: they are derived from the
+      // blocks, the witnesses and the authority set, and every one of those is either held
+      // or witnessed precisely so that forgetting does not change the answer.
+      //
+      // Skipping tight seeds entirely is why the tied-boundary divergence (auth.test.js,
+      // scenario X) was invisible here: a tight budget is the ONLY condition under which
+      // the eviction floor can climb past a revocation boundary at all.
       const snap = snapshot(s);
       if (tight) continue;
       if (reference === null) reference = snap;
@@ -402,7 +454,19 @@ test('property: eviction never lowers the frontier, however tight the budget', (
         // frontier has fallen back to the floor boundary itself, which a retraction can
         // do. There, the block is gone by design and floorHash/floorLamport are what
         // relink() chains the next one against, so the log is not stalled at all.
-        if (rep.linkedTo >= 0 && rep.linkedTo !== rep.floor - 1) {
+        // Only ABOVE the floor. This used to exempt exactly `linkedTo === floor - 1`,
+        // which was the previous invariant wearing a second coat: it assumed the only way
+        // a frontier sits below what we hold is that it fell back to the floor boundary.
+        // A delivery frontier can now sit anywhere below the floor, at a permanent stop
+        // that a forgotten claim no longer passes.
+        //
+        // What relink actually needs held is the ORDERING frontier's block, because walk
+        // one reads its lamport to chain the next one. A delivery frontier below the floor
+        // is a permanent stop and nothing ever reads past it.
+        if (rep.orderedTo >= rep.floor) {
+          assert.ok(rep.has(rep.orderedTo), `seed ${seed}: evicted the ordering frontier block`);
+        }
+        if (rep.linkedTo >= rep.floor) {
           assert.ok(rep.has(rep.linkedTo), `seed ${seed}: evicted the frontier block itself`);
         }
       }

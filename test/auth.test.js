@@ -960,22 +960,20 @@ test('review: an eviction floor cannot outrank a revocation boundary', () => {
   assert.equal(la, 3, 'and the honest answer is the revocation boundary minus one');
 });
 
-test('review: clamping the floor to a revocation costs ordering — characterised, not desired', () => {
-  // THIS TEST ASSERTS CURRENT BEHAVIOUR, NOT CORRECT BEHAVIOUR. It exists so the cost is a
-  // fact in the suite rather than a paragraph someone has to find, and so that anyone who
-  // fixes it gets a failure pointing straight at ARCHITECTURE.md R7.
+test('review: a revocation stops delivery without costing ordering', () => {
+  // This test used to assert the opposite, and said so in its first line: it recorded the
+  // cost of clamping the eviction floor to a revocation boundary, and promised that if
+  // orderedTo ever read 9 the ordering problem had been fixed. It reads 9.
   //
-  // The floor governs chain-verification and ORDERING as well as delivery. Bringing it down
-  // to a revocation boundary is therefore a bigger hammer than the problem: seq 9 below is
-  // held and chain-verified, and stops being orderable purely because the blocks between it
-  // and the lowered floor were already evicted. Other logs' deps resolve against orderedTo,
-  // so a log that did nothing wrong can stall on this.
+  // The floor governs chain-verification and ORDERING; a revocation is a statement about
+  // DELIVERY alone. Expressing one with the other cost ordering that nothing had withdrawn:
+  // seq 9 below is held and chain-verified, and used to be unorderable purely because the
+  // floor had been dragged down to a boundary beneath it. Other logs resolve their deps
+  // against orderedTo, so a log that did nothing wrong could stall on that.
   //
-  // The obvious alternative was built and rejected: bounding linkedTo alone drives it below
-  // floor - 1, and forgetOldest iterates [floor, linkedTo), so a revoked log stops being
-  // evictable at all. Two rules genuinely conflict once the floor climbs past a boundary,
-  // and the real fix is a deterministic eviction floor — an SP2 storage question, not a
-  // patch to #resolveFrontiers.
+  // What replaced the clamp is a witness, not a bigger hammer: what forgotten blocks CLAIMED
+  // is remembered run-length, and the delivery frontier is re-derived by running the same
+  // #authCheck against it. See ARCHITECTURE.md R7.
   const c = colony();
   const g = c.grant(0);
   const m = [];
@@ -987,12 +985,16 @@ test('review: clamping the floor to a revocation costs ordering — characterise
   load(s, [...m, ...c.blocks, g, rev]);
 
   const r = s.replica(c.M.logId.toString('hex'));
-  assert.equal(r.linkedTo, 3, 'delivery is correct: the revocation boundary minus one');
+  assert.equal(r.linkedTo, 3, 'delivery stops at the revocation boundary minus one');
+  assert.equal(r.chainTo, 9, 'the chain is untouched — a revocation is not a contradiction');
+  assert.equal(r.orderedTo, 9, 'and so is ordering: a revoked block is still orderable');
+  assert.ok(r.floor > 3, 'the floor stayed where eviction put it, and was not dragged down');
   assert.ok(r.blocks.has(9), 'seq 9 is still held');
-  assert.equal(r.chainTo, 9, 'and still chain-verified');
-  assert.equal(r.orderedTo, 3,
-    'but not orderable — THE COST. If this now reads 9, the ordering problem has been '
-    + 'fixed and ARCHITECTURE.md R7 should lose its residual paragraph.');
+
+  // Not a regression, and worth stating because R7 once argued from it: a log stopped by a
+  // revocation cannot shed the blocks above the stop on ANY replica, because forgetOldest
+  // takes only what is below linkedTo and nothing above a permanent stop ever is.
+  assert.equal(r.forgetOldest(), null, 'nothing above a permanent stop is evictable');
 });
 
 test("review: 'linked' fires when a late grant unblocks a backlog, not only on the ordinary path", () => {
@@ -1030,4 +1032,101 @@ test("review: 'linked' fires when a late grant unblocks a backlog, not only on t
   assert.equal(mr.linkedTo, 4, 'the backlog is delivered');
   assert.deepEqual(seen.sort((a, b) => a - b), [0, 1, 2, 3, 4],
     'and every delivered block must be announced, whichever path delivered it');
+});
+
+/**
+ * The world where a revocation and a re-grant share a boundary.
+ *
+ *   g0   pin 0 -> boundary 0, ownerSeq 1
+ *   rev  pin 3 -> boundary 4, ownerSeq 2
+ *   g4   pin 4 -> boundary 4, ownerSeq 3   (same boundary, later word, so it wins the tie)
+ *
+ * The tie is why the rule sorts by (boundary, ownerSeq) at all. It is also what makes the
+ * eviction clamp blind: the clamp scans for a boundary whose GOVERNING entry is a
+ * revocation, and here a grant wins boundary 4, so the clamp finds nothing to clamp — while
+ * #authCheck still stops any block citing g0 at seq >= 4, because the revocation's boundary
+ * is above g0's.
+ */
+function tiedWorld() {
+  const c = colony();
+  const g0 = c.grant(0);
+  const rev = c.revoke(3);
+  const g4 = c.grant(4);
+  return { c, g0, rev, g4 };
+}
+
+test('review: a revocation hidden behind a tie still stops an evicted log (X)', () => {
+  // Every member block cites g0. At seq >= 4 the governing entry is g4 — a grant, so no
+  // early stop — but the cited grant g0 was cut off by a revocation whose boundary (4) is
+  // above g0's (0), so the supersession loop stops it. The honest frontier is 3.
+  //
+  // A replica that evicted past seq 4 before the owner's word arrived never re-examines any
+  // of it: #resolveFrontiers resets to floor - 1, the clamp finds no revocation-governed
+  // boundary to lower the floor to, and the walk starts above everything the revocation was
+  // about. Same blocks, same rule list, permanently different answers.
+  //
+  // No rule computed from (floor, rule list) alone can fix this, which is the point: the
+  // verdict for an evicted seq depends on what that block CITED, and eviction deleted it.
+  const a = tiedWorld();
+  const mA = [];
+  for (let i = 0; i < 10; i++) mA.push(a.c.mw.push({ payload: Buffer.from(`x${i}`), authRef: a.g0.hash }));
+
+  const fresh = new Substrate();
+  load(fresh, [...a.c.blocks, a.g0, a.rev, a.g4, ...mA]);
+  const lf = fresh.replica(a.c.M.logId.toString('hex')).linkedTo;
+
+  // The same world, but the member is delivered and evicted before the owner speaks.
+  const b = tiedWorld();
+  const mB = [];
+  for (let i = 0; i < 10; i++) mB.push(b.c.mw.push({ payload: Buffer.from(`x${i}`), authRef: b.g0.hash }));
+  const width = mB[0].cert.length + 8;
+  const tight = new Substrate({ maxBytes: width * 3 });
+  load(tight, [...mB, ...b.c.blocks, b.g0]);   // links, then the budget bites
+  load(tight, [b.rev, b.g4]);                  // revocation first: it still governs the tie
+  const lt = tight.replica(b.c.M.logId.toString('hex')).linkedTo;
+
+  // And again with the two control blocks swapped. THIS is the one that bites: with g4
+  // already present, the grant wins boundary 4, so the clamp scan finds no
+  // revocation-governed boundary and lowers nothing — while #authCheck still stops every
+  // block citing g0 from seq 4 up. The clamp and the check disagree about the same tie.
+  const d = tiedWorld();
+  const mD = [];
+  for (let i = 0; i < 10; i++) mD.push(d.c.mw.push({ payload: Buffer.from(`x${i}`), authRef: d.g0.hash }));
+  const tight2 = new Substrate({ maxBytes: (mD[0].cert.length + 8) * 3 });
+  load(tight2, [...mD, ...d.c.blocks, d.g0]);
+  load(tight2, [d.g4, d.rev]);                 // re-grant first
+  const lt2 = tight2.replica(d.c.M.logId.toString('hex')).linkedTo;
+
+  assert.equal(lf, 3, 'the honest frontier is the revocation boundary minus one');
+  assert.equal(lt, lf,
+    `arrival order decided delivery: ${lt} with the revocation first, ${lf} on a fresh replica`);
+  assert.equal(lt2, lf,
+    `arrival order decided delivery: ${lt2} with the re-grant first, ${lf} on a fresh replica`);
+});
+
+test('review: a tie the re-grant wins must NOT stop the log (Y)', () => {
+  // The mirror, and the guard against over-fixing X. Here the later blocks cite g4 — the
+  // grant that wins boundary 4 — so nothing supersedes them and the frontier must reach 9.
+  // A fix that closes X by treating any revocation at a tied boundary as a stop would break
+  // re-grant outright, and this is the test that says so.
+  const a = tiedWorld();
+  const m = [];
+  for (let i = 0; i < 4; i++) m.push(a.c.mw.push({ payload: Buffer.from(`y${i}`), authRef: a.g0.hash }));
+  for (let i = 4; i < 10; i++) m.push(a.c.mw.push({ payload: Buffer.from(`y${i}`), authRef: a.g4.hash }));
+
+  const fresh = new Substrate();
+  load(fresh, [...a.c.blocks, a.g0, a.rev, a.g4, ...m]);
+  assert.equal(fresh.replica(a.c.M.logId.toString('hex')).linkedTo, 9,
+    'the restoring grant governs from seq 4 and nothing cuts it off');
+
+  const b = tiedWorld();
+  const mB = [];
+  for (let i = 0; i < 4; i++) mB.push(b.c.mw.push({ payload: Buffer.from(`y${i}`), authRef: b.g0.hash }));
+  for (let i = 4; i < 10; i++) mB.push(b.c.mw.push({ payload: Buffer.from(`y${i}`), authRef: b.g4.hash }));
+  const width = mB[0].cert.length + 8;
+  const tight = new Substrate({ maxBytes: width * 3 });
+  load(tight, [...mB, ...b.c.blocks, b.g0]);
+  load(tight, [b.rev, b.g4]);
+  assert.equal(tight.replica(b.c.M.logId.toString('hex')).linkedTo, 9,
+    'and forgetting the blocks does not change who was authorised');
 });

@@ -88,6 +88,16 @@ const AUTHORITY = new Set([TYPE.COLONY_GENESIS, TYPE.ROLE_GRANT, TYPE.ROLE_REVOK
 
 /** How many forgotten blocks' positions one replica remembers. See LogReplica#lost. */
 export const LOST_CAP = 4096;
+
+/**
+ * How many runs of forgotten CLAIMS one replica remembers. See LogReplica#claims.
+ *
+ * A run, not a block: one entry covers every consecutive block citing the same authority in
+ * the same scope, so an ordinary member citing one grant for their whole history costs one.
+ * Only an author who alternates citations block by block reaches this, and only on their own
+ * log. Past it the oldest forgotten history keeps the verdict it was delivered under.
+ */
+export const CLAIMS_CAP = 256;
 const KEEP_FOREVER = AUTHORITY;
 
 export class LogReplica {
@@ -121,6 +131,16 @@ export class LogReplica {
     // A lamport is 8 bytes and a hash key is 64 chars of hex, so this is ~2 KB per
     // thousand evicted blocks — small, but not free and not unbounded: see LOST_CAP.
     this.lost = new Map();
+    // WHAT forgotten blocks claimed, run-length: [{ from, scope, ref }], a new entry only
+    // when the (scope, auth_ref) pair changes.
+    //
+    // The third witness, and the one that was missing. floorHash witnesses the chain;
+    // floorLamport and `lost` witness ordering; nothing witnessed the CLAIM, so a verdict
+    // about an evicted block could not be re-asked — and #authCheck's answer depends on
+    // what the block cited, which eviction had deleted. Every rule computed from the floor
+    // and the rule list alone is blind in the same way, which is why the clamp that used to
+    // live in #resolveFrontiers could not be made correct.
+    this.claims = [];
     this.bytes = 0;
     this.forgotten = 0;
     this.linkedTo = -1; // highest seq reachable by prev_hash from 0, AND lamport-derived
@@ -174,6 +194,15 @@ export class LogReplica {
       this.floor = s + 1;
       if (!b) continue;
       if (b.hash) { this.floorHash = b.hash; this.floorLamport = b.lamport; }
+      // Before the KEEP_FOREVER skip: what a block claimed matters whether or not we keep
+      // its bytes, and the run is keyed by seq so it must not develop holes.
+      if (b.authRef && b.scopeId) {
+        const last = this.claims[this.claims.length - 1];
+        if (!last || !last.scope.equals(b.scopeId) || !last.ref.equals(b.authRef)) {
+          this.claims.push({ from: s, scope: b.scopeId, ref: b.authRef });
+          if (this.claims.length > CLAIMS_CAP) this.claims.shift();
+        }
+      }
       if (KEEP_FOREVER.has(b.type)) continue; // authority outlives the byte budget
       this.blocks.delete(s);
       if (s < this.bits.size && this.bits.has(s)) {
@@ -784,6 +813,8 @@ export class Substrate extends EventEmitter {
       lamport: b.lamport,
       type: b.type,
       scopeId: Buffer.from(b.scopeId),
+      // Kept so eviction can record what this block claimed without re-decoding the cert.
+      authRef: Buffer.from(b.authRef),
       bytes,
     });
     r.bytes += bytes;
@@ -919,43 +950,15 @@ export class Substrate extends EventEmitter {
     this.authSig = sig;
     this.tel?.count('substrate.resolved');
 
-    // THE FLOOR CANNOT OUTRANK A REVOCATION BOUNDARY, which is R4e's sentence about forks
-    // with one word changed. It was written for forks and never for revocations, and the
-    // gap is only reachable under a tight budget: a member delivered and then evicted
-    // before the owner's word arrives leaves the floor ABOVE the boundary, and the reset
-    // below starts every frontier at floor - 1 — above everything the revocation was about.
-    // The rewalk then never examines a single revoked block. The replica that heard the
-    // owner first stopped at the boundary; this one believes those blocks are linked, and
-    // holds the very revocation that says otherwise (AUTHORITY is KEEP_FOREVER, so it
-    // cannot even have forgotten it). Arrival order decided delivery, which is the one
-    // outcome this substrate exists to rule out.
-    //
-    // Bringing the floor down does not un-evict anything — those blocks are gone, and that
-    // is the point. The walk restarts at the boundary, finds nothing there, and stops,
-    // which is exactly the answer the other replica reached by reading the chain.
-    for (const [k, list] of this.auth.rule) {
-      const r = this.logs.get(k.slice(0, k.indexOf('|')));
-      if (!r) continue;
-      // The entry governing a boundary is the LAST one carrying it — the list is sorted by
-      // boundary then ownerSeq. A boundary only stops the log if a revocation wins it; a
-      // re-grant sharing that boundary takes it straight back, and must not clamp anything.
-      let stop = null;
-      for (let i = 0; i < list.length; i++) {
-        if (i + 1 < list.length && list[i + 1].boundary === list[i].boundary) continue;
-        if (list[i].kind === 'revoke') { stop = list[i].boundary; break; } // sorted, so lowest
-      }
-      if (stop !== null && r.floor > stop) {
-        r.floor = stop;
-        r.floorHash = null;   // it described a block we no longer stand behind
-        r.floorLamport = 0n;
-      }
-    }
-
     const resolve = (h) => this.resolveDep(h);
     const authOf = (r, seq, d) => this.#authCheck(r, seq, d);
     const lostOf = (h) => this.lostLamport(h);
     for (const r of this.logs.values()) {
-      r.linkedTo = r.floor - 1;
+      // Delivery starts where the forgotten claims stop passing, which is the floor when
+      // everything we forgot still passes. Ordering still starts at the floor: a revocation
+      // is a statement about DELIVERY, and a revoked block is still perfectly orderable —
+      // other logs resolve their deps against orderedTo.
+      r.linkedTo = this.#forgottenStop(r) - 1;
       r.orderedTo = r.floor - 1;
       r.pendingDeps = false;
     }
@@ -1003,6 +1006,38 @@ export class Substrate extends EventEmitter {
     return true;
   }
 
+  /**
+   * The first seq below the floor whose forgotten claim no longer passes, or the floor when
+   * every claim we forgot still does.
+   *
+   * Walk two, run against the witness instead of the block — the same #authCheck, so there
+   * is exactly one reading of the rule and nothing to disagree with. That is the whole
+   * reason this replaced a scan of the rule list: the scan was a second, hand-rolled answer
+   * to "which entry governs", which is the two-rules-for-one-question shape R6 forbids, and
+   * it was wrong wherever a re-grant tied a revocation's boundary — it saw a grant win the
+   * tie and lowered nothing, while #authCheck still stopped every block citing the older
+   * grant.
+   *
+   * Within one run the verdict is monotone: a claim that was ever ok can only turn to stop
+   * at a rule boundary, because both routes to stopping it (a revocation reaching this seq,
+   * or one superseding the cited grant) first bite at a boundary. So only the run's start
+   * and the boundaries inside it are asked — O(runs x |rule|), not O(floor).
+   */
+  #forgottenStop(r) {
+    for (let i = 0; i < r.claims.length; i++) {
+      const c = r.claims[i];
+      const next = i + 1 < r.claims.length ? r.claims[i + 1].from : r.floor;
+      const to = Math.min(next, r.floor);
+      if (c.from >= to) continue;
+      const d = { authRef: c.ref, scopeId: c.scope };
+      const list = this.auth.rule.get(`${r.key}|${c.scope.toString('hex')}`) || [];
+      const ask = [c.from];
+      for (const e of list) if (e.boundary > c.from && e.boundary < to) ask.push(e.boundary);
+      for (const q of ask) if (this.#authCheck(r, q, d) !== 'ok') return q;
+    }
+    return r.floor;
+  }
+
   #recordFork(r, seq, keptHash, otherHash, certA, certB) {
     const lowered = seq < r.forkedAt;
     let moved = false; // did a frontier or the floor actually shift?
@@ -1039,6 +1074,9 @@ export class Substrate extends EventEmitter {
         r.floor = seq;
         r.floorHash = null;
         r.floorLamport = 0n;
+        // The claim witness goes with the floor, for the same reason: it described blocks on
+        // a branch we no longer stand behind.
+        r.claims = r.claims.filter((c) => c.from < seq);
         moved = true;
       }
     }
