@@ -392,7 +392,25 @@ export class LogReplica {
       if (!b) break;
       if (authOf) {
         const verdict = authOf(this, s, decodeBlock(b.cert));
-        if (verdict === 'stall') { this.pendingDeps = true; break; }
+        // STALL, but NOT recorded as pending. pendingDeps is the filter deciding which
+        // replicas #relinkAll re-walks on every subsequent insert anywhere in the
+        // substrate, and an authority stall never needs it: every way one can be lifted —
+        // the colony becoming known, the cited grant arriving or becoming chain-reachable,
+        // the owner speaking about this range — happens when an AUTHORITY block arrives or
+        // comes into reach, and that path sets reachedAuthority, which resets every
+        // frontier and re-walks everything regardless of this flag.
+        //
+        // Keeping it was a standing invitation: a citation that can never become valid
+        // never clears it, so one block from an identity with no standing, naming an
+        // auth_ref that does not exist, bought a re-walk of that replica on every insert
+        // for the lifetime of the process. Measured at exactly double — 200 relink calls
+        // over 200 inserts became 400 — and repeatable up to MAX_LOGS.
+        //
+        // Verified rather than argued: with this removed, a 300-world all-tight sweep
+        // diverges on the same 12 worlds as before, and the case that would break if the
+        // reasoning were wrong — a grant held but unreachable behind a gap, made reachable
+        // later by an ORDINARY owner block — still promotes the stalled member.
+        if (verdict === 'stall') break;
         if (verdict === 'stop') break; // the authority claim fails. Delivery ends here.
       }
       this.linkedTo = s;

@@ -244,7 +244,13 @@ test('a block citing a grant we do not hold STALLS; it does not link and does no
   const key = w.M.logId.toString('hex');
   const mr = s.replica(key);
   assert.equal(mr.linkedTo, -1, 'nothing links while the cited grant is unknown');
-  assert.ok(mr.pendingDeps, 'and it is recorded as waiting, not as broken');
+  // Observably a STALL and not a STOP: nothing links, and nothing is decided against, so
+  // the same block delivers the moment the grant shows up. Asserted through behaviour
+  // rather than through pendingDeps, which is a scheduling flag and not the property —
+  // an authority stall no longer sets it, because every way one can be lifted goes through
+  // a full re-resolution anyway.
+  assert.equal(mr.linkedTo, -1, 'nothing links');
+  assert.ok(mr.chainTo >= 0, 'but the chain itself is fine — this is not a broken log');
 
   s.insert(w.grant.cert, w.grant.payload, w.grant.authorPub);
   assert.equal(s.replica(key).linkedTo, 2, 'the moment the grant arrives, the run promotes');
@@ -779,7 +785,15 @@ test('re-grant: nothing is authorised in a range the owner has not spoken about'
 
   const mr = s.replica(c.M.logId.toString('hex'));
   assert.equal(mr.linkedTo, -1, 'nothing links');
-  assert.ok(mr.pendingDeps, 'and it is recorded as waiting, not as decided against');
+  // Waiting, not decided against — asserted as behaviour rather than through pendingDeps,
+  // which is a scheduling flag an authority stall no longer sets.
+  //
+  // Note what this block can NEVER become: it cites a grant pinned at 4 while sitting at
+  // seq 0, so the moment the owner does speak about seq 0 the citation fails on
+  // `cited.boundary > seq` and turns to stop. The stall is about the OWNER having said
+  // nothing that reaches here yet, not about this block eventually being fine — a first
+  // draft of this assertion got that backwards and was corrected by the code.
+  assert.ok(mr.chainTo >= 0, 'the chain is verified; only the authority claim is unanswered');
 });
 
 test('re-grant: a restored member must cite the new grant, not the revoked one', () => {
@@ -1131,4 +1145,53 @@ test('review: a tie the re-grant wins must NOT stop the log (Y)', () => {
   load(tight, [b.rev, b.g4]);
   assert.equal(tight.replica(b.c.M.logId.toString('hex')).linkedTo, 9,
     'and forgetting the blocks does not change who was authorised');
+});
+
+test('review: an unsatisfiable citation costs nothing after the block that carries it', () => {
+  // pendingDeps is the filter deciding which replicas #relinkAll re-walks on every
+  // subsequent insert anywhere in the substrate. An authority stall used to set it, and a
+  // citation naming an auth_ref that does not exist can never become valid, so the flag
+  // never cleared: one block, from an identity with no standing whatsoever, bought a
+  // re-walk of that replica on every insert for the lifetime of the process.
+  //
+  // Measured before the fix at exactly double — 200 relink calls over 200 inserts became
+  // 400 — and repeatable up to MAX_LOGS. This is the same shape R4f was written to close,
+  // at the finer #relinkAll granularity R4f's authority-signature short-circuit does not
+  // reach.
+  //
+  // The flag is unnecessary there: every way an authority stall can be lifted happens when
+  // an AUTHORITY block arrives or comes into reach, and that path sets reachedAuthority,
+  // which resets every frontier and re-walks everything regardless.
+  const count = (plant) => {
+    const c = colony();
+    const s = new Substrate();
+    load(s, c.blocks);
+
+    if (plant) {
+      const ghost = identity();
+      const gw = writer(ghost, c.scopeId);
+      const b = gw.push({ payload: Buffer.from('ghost'), authRef: Buffer.alloc(32, 0xab) });
+      load(s, [b]);
+    }
+
+    const proto = Object.getPrototypeOf([...s.logs.values()][0]);
+    const orig = proto.relink;
+    let calls = 0;
+    proto.relink = function counted(...a) { calls += 1; return orig.apply(this, a); };
+    try {
+      for (let i = 0; i < 40; i++) load(s, [c.ow.push({ payload: Buffer.from(`t${i}`) })]);
+    } finally {
+      proto.relink = orig;
+    }
+    return calls;
+  };
+
+  const clean = count(false);
+  const planted = count(true);
+  // Tight on purpose. The effect is exactly one extra relink per insert, so a threshold of
+  // clean + 40 over 40 inserts admits the entire bug — a first draft did, and passed
+  // against the mutant, which is the whole reason to falsify a test rather than trust it.
+  assert.ok(planted <= clean + 4,
+    `a single unsatisfiable citation added ${planted - clean} relink calls over 40 inserts `
+    + `(${clean} -> ${planted}); it must cost nothing ongoing`);
 });
