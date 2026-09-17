@@ -582,7 +582,7 @@ than the message content" self-assessment; do not soften it in product copy.
 | Content confidentiality against a VAULT/RELAY that never held `epoch_root` | **Yes** | AEAD security; `epoch_root` never transits a VAULT-only code path (§2.4) | A VAULT that is *also* a current or former member |
 | Full forward secrecy + PCS at the hypha/transport layer | **Yes** (unchanged from SP1) | Noise XX `ee`/rehandshake correctness, verified vs. Cacophony vectors | Compromise of both parties' live ephemeral state — untouched by SP2 |
 | Zero-round-trip, out-of-order decryption of any block from any VAULT | **Yes** | Requester already holds `epoch_root` for that block's `epoch_hash` | Requester missed a rotation (partition) with no KEYBUNDLE/supplemental wrap yet |
-| Deterministic, order-independent agreement on which `epoch_hash` is valid | **Yes** | §1.19's `auth_ref` recomputation fix is live; `final`/`cut(R)` are pure functions of the delivered block set (§2.1) | A spore that has not yet delivered the same block set — a knowledge gap, not a convergence failure; surfaces as a graceful fork, heals per §2.1 |
+| Deterministic, order-independent agreement on which `epoch_hash` is valid | **Yes** | ARCHITECTURE.md **R4**'s `pin_seq` rule is live — NOT §1.19's `auth_ref` recomputation fix, which R4 records as not closing §1.19 at all; `final`/`cut(R)` are pure functions of the delivered block set (§2.1) | A spore that has not yet delivered the same block set — a knowledge gap, not a convergence failure; surfaces as a graceful fork, heals per §2.1 |
 | A rotation citing a ban never wraps the banned member | **Yes** | Wrap-set content check (§2.1 clause d) at the rotation's own causal cut | A ban not yet in the minter's causal cut (bounded by §1.19's staleness window); closed once any honest current holder mints citing the unconsumed ban |
 | Exclusion from *future* content once rotation propagates | **Yes, partition-limited** | Rotation reaches the excluded device's partition; some current BAN/KICK holder notices and mints | An indefinite partition no reachable holder ever notices — named open |
 | `has_read_cap` correctly excludes non-members from INDEX/FORGE candidacy | **Yes** (Layer 1) | Per-fruiting VIEW resolution converges (existing Pass A/B property) | None known — hard, public, keyless precondition |
@@ -647,16 +647,53 @@ tree *reduces* surface area rather than adding any.
 
 Each step is independently testable against a concrete scenario before the next begins.
 
-1. **Land the §1.19 `auth_ref`/`deps` causal-binding recomputation fix, substrate-wide.**
-   Test: replay CORRECTNESS.md's stale-`auth_ref` (V1) scenario; confirm rejection.
+> **Reconciled against the decision record, 2026-09-17.** This sequence was written before
+> R1 and R4 and contradicted both. Two steps below are struck through rather than deleted,
+> because the reasoning that failed is the useful part and a reader who finds the old text
+> quoted elsewhere should be able to see what happened to it.
+
+1. ~~**Land the §1.19 `auth_ref`/`deps` causal-binding recomputation fix, substrate-wide.**~~
+   **VOID — this step was an instruction to reintroduce a bug the project has already
+   disproved.** ARCHITECTURE.md R4: *"§1.19's adopted fix does not close §1.19. Implementing
+   it is what revealed that... V1's attacker picks both the lamport and the dep set, so every
+   rule phrased in terms of either is a rule the attacker satisfies for free."* A
+   causal-binding recomputation is precisely a rule phrased in terms of the dep set.
+
+   What shipped instead is R4's `pin_seq`: `ROLE_REVOKE` carries the revoker's view of the
+   target's head, and a block by the target above that pin carrying a non-zero `auth_ref`
+   stops the log. The one field an author cannot choose is their own `seq`. Refined since by
+   R6 (one ordered list of boundaries, so grants and revocations cannot be read by two
+   different rules) and R7 (a claim witness, so a verdict survives eviction).
+
+   **Nothing to land. The test this step asked for already exists** — CORRECTNESS.md's V1
+   scenario is `test/auth.test.js`, and it has been green since the pin landed.
 2. **Implement per-colony `wrap_seed(colonyId)`**, distinct from `dh_seed`, published in
-   `MEMBER_JOIN`. **SP1 colonies' existing `MEMBER_JOIN` blocks predate this field**, so every
-   pre-existing member must publish `wrap_pub_c` via a small dedicated block (or a `MEMBER_JOIN`
-   re-announcement) before that colony can run any rotation; gate step 5 on this having landed
-   for a member before treating their absence from a wrap-set as anything other than "hasn't
-   published yet." Test: two colonies on one device produce different `wrap_pub`; assert it
-   never equals the device's Noise static; assert a colony with un-migrated members correctly
-   reports them as not-yet-wrappable rather than silently omitting them.
+   `MEMBER_JOIN`. This is now **step 1**, and it is where SP2 actually begins.
+
+   ~~SP1 colonies' existing `MEMBER_JOIN` blocks predate this field, so every pre-existing
+   member must publish `wrap_pub_c` via a small dedicated block...~~ **VOID — R1 deleted this
+   migration.** *"SP1 colonies do not carry forward to SP2. Compatibility is broken
+   deliberately... We are not building that."* An SP2 colony has `wrap_pub_c` in every
+   `MEMBER_JOIN` by construction, so there is no un-migrated member to gate step 5 on and no
+   dual-mode read path. A member absent from a wrap-set is absent, full stop — which is a
+   simpler and stricter rule than the one this step was hedging around.
+
+   Test: two colonies on one device produce different `wrap_pub`; assert it never equals the
+   device's Noise static.
+> **Open, and it must be settled before step 5, not discovered during it.** Are
+> `EPOCH_ROTATE` and `KEYBUNDLE` `KEEP_FOREVER`? They are control blocks and the substrate's
+> instinct is yes. But `KEEP_FOREVER` blocks are exempt from the byte budget, rotations are
+> minted per membership change, and R4c's retention residual is currently bounded by *how
+> much authority a colony writes*. Make rotations unevictable and that residual starts
+> scaling with **membership churn** — at which point it is no longer a residual, it is a
+> growth curve, and R4c's "best-effort in the presence of authority" stops being an honest
+> description. Note also that R4c understates the exposure already: retention is keyed on wire
+> TYPE with no standing check, so any identity can mint retained blocks in its own log.
+>
+> If the answer is yes, R4c needs rewriting and the byte budget needs a second bound. If the
+> answer is no, rotations must be recoverable from peers after eviction, which is a fetch path
+> that does not exist yet. Neither is hard; picking one after step 5 is built would be.
+
 3. **Implement the flat sender-key chain** with `boot_nonce` folded into `sender_root`; do not
    build the GGM tree. Test: derive `message_key(i)` at `i = 0, 1000, 4_000_000` in O(1); confirm
    a simulated process restart (fresh `boot_nonce`) never collides with a prior boot's keys at
