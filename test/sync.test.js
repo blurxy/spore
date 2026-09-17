@@ -1138,6 +1138,17 @@ test('wire: the advertised-set allocation is bounded across ALL logs, not just o
   // And the cap is not in the way of anything real: a million blocks in one log is still
   // expressible, which at ~320 bytes each is already past any phone's storage budget.
   assert.ok(MAX_SEQ >= (1 << 20) - 1, 'a log must still hold ~1M blocks');
+
+  // WHAT THIS TEST DOES NOT BOUND, said here because the last comment that left it unsaid is
+  // the reason this test exists. #recvHaveAdd allocates per (log, PEER), and nothing caps the
+  // number of connected hyphae — so the real worst case is the figure above times the peer
+  // count, and this assertion covers one peer's share of it.
+  //
+  // It cannot be fixed by lowering MAX_SEQ further: the multiplier is a quantity we do not
+  // control, and a bound that depends on an attacker's restraint is not a bound. The fix is a
+  // window above our own linkedTo, which bounds the scan, the allocation and the unlinked
+  // bytes together. Until that lands this is a partial bound, and saying so is the point.
+  assert.ok(worst * 2 > worst, 'per-peer multiplier is unbounded — see the comment above');
 });
 
 test('sharding: the scheduler never asks for a block below our own floor', () => {

@@ -80,9 +80,19 @@ const PAIR = LOG_ID + 4; // (log_id, seq)
 // this codebase's recurring shape once more — a bound that is correct about the quantity it
 // names and silent about the one that matters.
 //
-// 2^20 gives 128 KB per log, 32 MB across the cap, and still allows a million blocks in one
-// log — which at ~320 bytes each is 335 MB of content, far past any phone's budget. The
-// ceiling that binds first should be the honest one.
+// 2^20 gives 128 KB per log and still allows a million blocks in one log — which at ~320
+// bytes each is 335 MB of content, far past any phone's budget.
+//
+// AND THE SAME MISTAKE AGAIN, ONE LEVEL UP. The first version of this comment said "32 MB
+// across the cap". That is 128 KB x MAX_LOGS, and the allocation in #recvHaveAdd is per
+// (log, PEER) — so it is 32 MB x the number of connected hyphae, and nothing caps that
+// number. I multiplied by the log cap and not by the peer cap, having just written a commit
+// message about a comment that multiplied by neither.
+//
+// So this constant does NOT bound the advertised-set allocation. It bounds one peer's share
+// of it. The real bound has to come from OUR frontier rather than from a limit on what a peer
+// may claim, because the multiplier is a quantity we do not control. Recorded in
+// docs/RESULTS-2026-09-17.md; the fix is a window above linkedTo, not a smaller MAX_SEQ.
 export const MAX_SEQ = 0xfffff;
 
 export class WireError extends Error {
