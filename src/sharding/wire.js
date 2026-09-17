@@ -68,7 +68,22 @@ const PAIR = LOG_ID + 4; // (log_id, seq)
  * the check. 16M blocks at the 32 KB the harness uses is half a terabyte in one log; a
  * log that long has other problems first, and the bitfield costs 2 MB.
  */
-export const MAX_SEQ = 0xffffff;
+// 2^20 - 1, not 2^24 - 1, and the difference is 480 MB.
+//
+// A peer's advertised set is a Bitfield sized from the seq it claims (sync.js #recvHaveAdd:
+// `new Bitfield(seq + 1)`), which allocates ceil(size/8). At 0xffffff that is 2 MB per log,
+// and MAX_LOGS is 256 — so ONE ~5 KB HAVE_ADD frame carrying 256 (logId, 0xffffff) pairs
+// allocated 512 MB. No signature is involved on that path: the pairs are bare, and this cap
+// was the only thing standing in front of the allocation.
+//
+// The original comment justified 2^24 per log and never multiplied by the log cap. That is
+// this codebase's recurring shape once more — a bound that is correct about the quantity it
+// names and silent about the one that matters.
+//
+// 2^20 gives 128 KB per log, 32 MB across the cap, and still allows a million blocks in one
+// log — which at ~320 bytes each is 335 MB of content, far past any phone's budget. The
+// ceiling that binds first should be the honest one.
+export const MAX_SEQ = 0xfffff;
 
 export class WireError extends Error {
   constructor(code) { super(code); this.code = code; }

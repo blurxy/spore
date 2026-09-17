@@ -1115,3 +1115,26 @@ test('store: a block naming more deps than there are logs is refused', () => {
   assert.notEqual(s2.insert(okCert, Buffer.alloc(0), id.pub).reason, 'dep_count',
     'exactly MAX_LOGS deps is legal');
 });
+
+test('wire: the advertised-set allocation is bounded across ALL logs, not just one', () => {
+  // The bound that was missing. A peer HAVE_ADD carries bare (logId, seq) pairs and sync.js
+  // sizes a Bitfield straight from the seq claimed — ceil(size/8) bytes, and no signature is
+  // involved on that path. MAX_SEQ was the only thing standing in front of it, and it had
+  // been justified PER LOG: 2 MB each sounded tolerable, and nobody multiplied by MAX_LOGS.
+  // One ~5 KB frame carrying 256 maximal pairs demanded 512 MB.
+  //
+  // So the invariant is the PRODUCT, and it is asserted as the product. Raise MAX_SEQ again
+  // and this fails, which is the point — the previous bound was correct about the quantity it
+  // named and silent about the one that mattered.
+  const perLog = Math.ceil((MAX_SEQ + 1) / 8);
+  const worst = perLog * MAX_LOGS;
+  assert.ok(
+    worst <= 64 * 1024 * 1024,
+    `worst-case advertised-set allocation is ${Math.round(worst / 1048576)} MB `
+    + `(${perLog} B/log x ${MAX_LOGS} logs) — one unsigned frame can demand all of it`,
+  );
+
+  // And the cap is not in the way of anything real: a million blocks in one log is still
+  // expressible, which at ~320 bytes each is already past any phone's storage budget.
+  assert.ok(MAX_SEQ >= (1 << 20) - 1, 'a log must still hold ~1M blocks');
+});

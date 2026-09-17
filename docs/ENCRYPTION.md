@@ -729,12 +729,18 @@ Each step is independently testable against a concrete scenario before the next 
 > has no analogue. The substrate's instinct is "keep" only for what the substrate *computes
 > from*.
 >
-> **The payload cannot cross the wire at design scale anyway.** `MAX_BODY` is 65512 and a wrap
-> entry is 96 bytes, so an `EPOCH_ROTATE` block cannot be sent above ~678 members, and a
-> FROM_GENESIS `KEYBUNDLE` not above ~452 epochs. §2.1 already says the payload is fetched
-> separately from the header; `sync.js` has no such path and `BLOCK` is cert+payload atomic.
-> **The cert/payload split is therefore a step-5 prerequisite regardless of retention**, and it
-> is the same mechanism R7 names as the SP2 storage question. Three problems, one mechanism.
+> ~~**The payload cannot cross the wire at design scale anyway** — an `EPOCH_ROTATE` above
+> ~678 members exceeds `MAX_BODY`...~~ **STRUCK, 2026-09-17: this argument is moot and was
+> wrong to publish.** `MAX_LOGS` is 256, so a rotation wraps at most 256 recipients:
+> `32 + 96 × 256 = 24,608 B`, comfortably under `MAX_BODY = 65,512`. A FROM_GENESIS
+> `KEYBUNDLE` spanning many epochs is a list and can be minted as several blocks. Payload size
+> is not a reason for anything here. The conclusion — neither type is `KEEP_FOREVER` — stands
+> on the other two arguments, which is why this is struck rather than the section rewritten.
+>
+> The cert/payload split is still worth doing, but for reasons that have nothing to do with
+> SP2: a late joiner under a byte budget cannot link a log whose prefix every peer has evicted,
+> and fork-below-floor detection closes for free once cert entries are retained. Those are SP1
+> problems. See ARCHITECTURE.md.
 >
 > **And the DM case settles it on its own.** §2.1: a two-member fruiting rotates on every fresh
 > ephemeral contribution. `KEEP_FOREVER` would make every DM turn's companion rotation
