@@ -1042,7 +1042,7 @@ founder to have signed both at one seq, which is equivocation, and the log alrea
 
 **R4c. The byte budget is best-effort in the presence of authority, and says so.**
 
-R4b's "control blocks are never evictable" has a price, and it is not zero: nothing bounds how
+R4b's "control blocks are never evictable" has a price, and it is not zero. This once said "nothing bounds how many a colony owner may write", which understates who can reach it: `forgetOldest` exempts a block by its wire TYPE, with no standing check anywhere in the retention path, so **any** identity — with no colony relationship at all, not even a self-founded one — can write blocks typed `ROLE_GRANT` or `ROLE_REVOKE` in their own log and have them retained forever, at the same cost per block as the owner. `#rebuildAuth` computes that they carry no authority whatsoever; retention never asks it. Reviewed and kept as a residual rather than fixed, for the reason below, but the reader should know the exposure is not owner volume. Nothing bounds how
 many a colony owner may write, so a spore whose retained authority alone exceeds `maxBytes`
 cannot reach it. `#trim` now scans **every** replica in descending byte order before giving up
 — the previous version took the fattest, fell back to the fattest other one, and stopped, which
@@ -1244,19 +1244,59 @@ Both replicas holding that same revocation, which neither can have forgotten bec
 AUTHORITY is `KEEP_FOREVER`. The clamp respects supersession — only a boundary whose
 *governing* entry is a revocation stops the log, or re-grant would break outright.
 
-**The residual this leaves, stated rather than discovered later.** Clamping the floor is a
-bigger hammer than the problem: the floor governs chain-verification and ORDERING as well
-as delivery, so dropping it onto an already-evicted seq strands blocks that are held and
-perfectly orderable — `orderedTo` fell from 6 to 2 on a replica holding everything it
-needed, and other logs' deps resolve against `orderedTo`. The obvious alternative, bounding
-`linkedTo` alone and leaving the floor be, was built and rejected: it drives `linkedTo`
-below `floor - 1`, and `forgetOldest` iterates `[floor, linkedTo)`, so a revoked log stops
-being evictable at all. Two rules genuinely conflict once the floor climbs past a boundary
-— *you cannot un-deliver what you have already forgotten* and *you cannot claim delivery of
-blocks your own revocation stops* — and neither instrument expresses only what is meant.
-The floor clamp is what ships, its ordering cost is characterised by a test that asserts
-the current behaviour, and the real fix is a deterministic eviction floor, which is an SP2
-storage question and not a patch to `#resolveFrontiers`.
+**Superseded, and the correction belongs here rather than quietly in the code.** The clamp
+above shipped and was wrong twice, so it is gone. It was too big: the floor governs
+chain-verification and ORDERING as well as delivery, and a revocation is a statement about
+delivery alone — dropping the floor onto an already-evicted seq stranded blocks that were
+held and perfectly orderable, and other logs resolve their deps against `orderedTo`. And it
+was incorrect: the clamp scanned the rule list for a boundary whose *governing* entry is a
+revocation, which is a second, hand-rolled answer to "which entry governs" — the
+two-rules-for-one-question shape R6 exists to forbid — and it disagreed with `#authCheck`
+wherever a re-grant TIES a revocation's boundary. The scan sees a grant win the tie and
+lowers nothing; `#authCheck` still stops every block citing the older grant, because the
+revocation's boundary is above that grant's. Live divergence: `linkedTo` 8 on a replica that
+had evicted past the boundary, 3 on a fresh one, same blocks, same rule list. It is scenario
+X in `test/auth.test.js`, with mirror Y guarding against a fix that closes X by breaking
+re-grant outright.
+
+No rule computed from `(floor, rule list)` alone can be correct, and that is the lesson worth
+keeping: **the verdict for an evicted seq depends on what that block CITED, and eviction had
+deleted it.** So the fix is the third witness. `floorHash` witnesses the chain;
+`floorLamport` and `lost` witness ordering; nothing witnessed the CLAIM. `LogReplica#claims`
+now remembers what forgotten blocks cited, run-length, and `#forgottenStop` re-derives the
+delivery frontier by running the same `#authCheck` against it — one reading of the rule, with
+nothing left to disagree with.
+
+R7's own argument against the alternative was also wrong, and R8 records why: "a revoked log
+stops being evictable" is true of the shipped clamp too, and in fact of every replica before
+and after R7, because `forgetOldest` iterates below `linkedTo` and nothing above a permanent
+stop ever is. It never discriminated between the designs.
+
+**The residual this leaves, stated rather than discovered later.** Delivery below the floor is
+now re-judged from a witness, so it is bounded the way ordering's is: `CLAIMS_CAP` runs per
+replica, oldest-out, where a run is one `(scope, auth_ref)` pair — a member citing one grant
+costs a single entry however long they write, and only an author alternating citations block
+by block reaches the cap, on their own log alone. Past it, the oldest forgotten history keeps
+the verdict it was delivered under, which is the pre-R7 behaviour confined to what fell off
+the end, and a revocation reaching that far diverges from a replica that still holds the
+blocks. Two facts are unchanged by any of this and are recorded so nobody re-derives them: a
+log stopped by a revocation cannot shed the blocks above the stop on any replica; and a fork
+at a seq this replica has already forgotten cannot be witnessed locally, only learned from a
+peer's proof — which is why the property harness now replays `knownForks()` between replicas
+before it compares them, as `sync.js` does at every hypha setup.
+
+**What is not closed, and is not mine to claim closed.** The advisor pass that produced this
+design ran a wider sweep than the suite does — 300 seeds across three budgets, fresh plus four
+tight shuffles — and reported 248 of 900 worlds diverging before these changes and 38 after,
+every remaining one on `orderedTo` and none on delivery. That sweep was run on a separate copy
+and **has not been reproduced here**; the committed suite is 116 green at 60 seeds, which is a
+weaker statement. The shape it describes is a citer that was ordered, evicted, and whose dep a
+later fork in another log withdrew. One instance of that shape — seed 48 — is fixed, because
+`lost` now carries the seq and reports a retraction instead of laundering it. Whether others
+survive is open. The witness for that class is the dep list, which is the block header, and
+keeping headers past eviction would subsume `floorHash`, `floorLamport`, `lost` and `claims`
+in one mechanism. **That** is the SP2 storage question — the one this record previously
+misfiled the delivery half under.
 
 *Beneath all of it: agreement is not correctness.* Every property in `test/property.test.js`
 asserted CONVERGENCE — replicas fed the same blocks in any order reach the same state. The
@@ -1304,7 +1344,10 @@ that is exactly where it went wrong, because a revocation ends delivery only. Th
 between the two is the argument for revisiting R7, and R7’s stated reason for rejecting the
 `linkedTo` bound — “a revoked log stops being evictable” — does not survive contact with it:
 after the shipped clamp, `forgetOldest` iterates `[stop, stop - 1)`, which is empty too. The
-objection never discriminated between the two designs. The real difference is `orderedTo`.
+objection never discriminated between the two designs. Nor was `orderedTo` the only difference,
+as this once said: both clamps were CITATION-BLIND, so the one that shipped was incomplete as
+well as costly. R7 has the tied-boundary divergence it could not see, and the witness that
+replaced it.
 
 ## Open Decisions
 

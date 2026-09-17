@@ -928,9 +928,11 @@ test('review: an eviction floor cannot outrank a revocation boundary', () => {
   // evict it), permanently different answers. That is the one thing this substrate exists
   // to rule out.
   //
-  // The existing property harness cannot see this: it skips the cross-replica snapshot
-  // comparison whenever the budget is tight (test/property.test.js, `if (tight) continue`),
-  // which is the only condition under which the floor can climb past a boundary at all.
+  // The property harness could not see this when the test was written: it skipped the
+  // cross-replica comparison whenever the budget was tight, which is the only condition
+  // under which the floor can climb past a boundary at all. It compares frontiers on every
+  // seed now, so this scenario is covered there too — kept here because a named case with
+  // its numbers written down is worth more than a seed number when it next regresses.
   const build = () => {
     const c = colony();
     const g = c.grant(0);
