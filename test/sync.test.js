@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import { HyphaManager, MAX_WRITE_BUFFER } from '../src/transport/tcp.js';
 import { generateStatic } from '../src/session/noise.js';
-import { encodeBlock, logIdFor, newLogId, TYPE, FLAG } from '../src/substrate/block.js';
-import { Substrate } from '../src/substrate/store.js';
+import { encodeBlock, decodeBlock, logIdFor, newLogId, TYPE, FLAG } from '../src/substrate/block.js';
+import { Substrate, LOST_CAP } from '../src/substrate/store.js';
 import { Syncer } from '../src/sharding/sync.js';
 import { Telemetry } from '../src/telemetry/bus.js';
 import {
@@ -1032,4 +1032,37 @@ test('store: one fork proof per log, and a proof above the contradiction is free
   const [dupA, dupB] = twoAt(id, 9);
   assert.equal(s.acceptForkProof(dupA, dupB, id.pub).duplicate, true);
   assert.equal(r.forks.size, 1);
+});
+
+test('store: the forgotten-lamport witness is capped, oldest out', () => {
+  // `lost` remembers hash -> lamport for blocks this replica evicted, so a citer that
+  // arrives AFTER its dep was forgotten can still be ordered (R4e). It is the one map in
+  // LogReplica with an explicit cap, and the cap had zero coverage: delete the four lines
+  // that enforce it and the whole suite still passed, because nothing here ever caused
+  // anywhere near LOST_CAP evictions in one replica.
+  //
+  // That is the shape this repo keeps getting caught by — a bound that is real in the code
+  // today and would be silently removable tomorrow. `lost` is independent of maxBytes and
+  // has no other backstop: #trim and forgetOldest bound r.blocks and r.bytes, not this.
+  const id = identity();
+  const n = LOST_CAP + 200;
+  const blocks = chain(id, n);
+
+  // A budget that holds only a handful, so almost every block is evicted as it links.
+  const width = blocks[0].cert.length + 8;
+  const s = new Substrate({ maxBytes: width * 8 });
+  for (const b of blocks) s.insert(b.cert, b.payload, id.pub);
+
+  const r = s.replica(id.logId.toString('hex'));
+  assert.ok(r.forgotten > LOST_CAP, `the cap must actually be exercised (forgot ${r.forgotten})`);
+  assert.ok(r.lost.size <= LOST_CAP, `lost grew past its cap: ${r.lost.size} > ${LOST_CAP}`);
+
+  // Oldest out, not newest: the witness that survives is the one most likely to still be
+  // cited. A recently forgotten block is remembered; the very first one is not.
+  const hashOf = (b) => {
+    const d = decodeBlock(b.cert);
+    return d.blockHash.toString('hex');
+  };
+  assert.ok(!r.lost.has(hashOf(blocks[0])), 'the oldest witness was dropped');
+  assert.ok(r.lost.has(hashOf(blocks[n - 20])), 'a recent one was kept');
 });
