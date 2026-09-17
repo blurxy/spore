@@ -1195,3 +1195,52 @@ test('review: an unsatisfiable citation costs nothing after the block that carri
     `a single unsatisfiable citation added ${planted - clean} relink calls over 40 inserts `
     + `(${clean} -> ${planted}); it must cost nothing ongoing`);
 });
+
+test('review: retention follows what authority COUNTS, not what the wire type claims', () => {
+  // forgetOldest exempted a block by its wire type alone. #rebuildAuth, four hundred lines
+  // away, only counts a grant whose payload actually decodes — decodeGrant throws unless the
+  // payload is exactly GRANT_LEN, and the catch says `continue`. Those two facts together
+  // are an amplifier: a block typed ROLE_GRANT with a 64 KB payload carries ZERO authority
+  // by the substrate's own computation, and was kept forever anyway.
+  //
+  // ~290 bytes is what R4b's comment costs a control block at. 65 KB is 224x that, from any
+  // identity, with no colony relationship, no standing, and no key. Under a 64 MB budget
+  // that is about a thousand blocks to make everything else evictable disappear — #trim
+  // sacrifices real conversation to stay under a ceiling it cannot reach.
+  //
+  // The rule now matches the computation: exempt only what #rebuildAuth would actually
+  // count. Convergence-neutral by construction — a block #rebuildAuth skips contributes
+  // nothing to derived authority on ANY replica, so evicting it changes nothing anywhere.
+  const junk = Buffer.alloc(8192, 0x41);
+  const attacker = identity();
+  const scope = colonyIdFor(attacker.logId, 0);
+  const aw = writer(attacker, scope);
+
+  // Properly chained, properly signed, and completely meaningless: the payload cannot
+  // decode, so #rebuildAuth ignores every one of them.
+  const blocks = [aw.push({ type: TYPE.COLONY_GENESIS, payload: Buffer.from('colony') })];
+  for (let i = 0; i < 12; i++) {
+    blocks.push(aw.push({ type: TYPE.ROLE_GRANT, payload: junk }));
+  }
+
+  const s = new Substrate({ maxBytes: 16 * 1024 });
+  load(s, blocks);
+
+  const r = s.replica(attacker.logId.toString('hex'));
+  assert.equal(s.auth.grants.size, 0, 'the substrate agrees these grant nothing');
+  assert.ok(r.forgotten > 0, 'so they must be evictable like any other worthless bytes');
+  assert.ok(s.bytes <= s.maxBytes,
+    `budget blown by undecodable authority: ${s.bytes} > ${s.maxBytes}`);
+
+  // The real thing is still kept. A well-formed grant is what #rebuildAuth counts, so it
+  // keeps its exemption — this is the half that must not regress.
+  const c = colony();
+  const g = c.grant(0);
+  const m = [];
+  for (let i = 0; i < 8; i++) m.push(c.mw.push({ payload: Buffer.from(`m${i}`), authRef: g.hash }));
+  const s2 = new Substrate({ maxBytes: (m[0].cert.length + 8) * 3 });
+  load(s2, [...c.blocks, g, ...m]);
+  const or = s2.replica(c.O.logId.toString('hex'));
+  assert.ok(or.blocks.has(g.seq), 'a grant that actually grants is still kept forever');
+  assert.ok(s2.replica(c.M.logId.toString('hex')).forgotten > 0, 'while ordinary traffic goes');
+});

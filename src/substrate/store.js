@@ -30,7 +30,7 @@ import { EventEmitter } from 'node:events';
 import { createPublicKey } from 'node:crypto';
 import {
   verifyBlock, decodeBlock, logIdMatches, hash256, HEADER_LEN, SIG_LEN,
-  TYPE, decodeGrant, decodeRevoke, colonyIdFor,
+  TYPE, decodeGrant, decodeRevoke, colonyIdFor, GRANT_LEN, REVOKE_LEN,
 } from './block.js';
 import { Bitfield } from '../sharding/scheduler.js';
 // MAX_SEQ is a wire constant, but the thing it protects lives here: seq sizes LogReplica#bits.
@@ -107,6 +107,31 @@ export const CLAIMS_CAP = 256;
  */
 const RETRACTED = Symbol('retracted');
 const KEEP_FOREVER = AUTHORITY;
+
+/**
+ * Would #rebuildAuth actually COUNT this block?
+ *
+ * Retention used to ask only `KEEP_FOREVER.has(b.type)` — the wire type byte, chosen by the
+ * author. #rebuildAuth, four hundred lines away, counts far less than that: `decodeGrant`
+ * throws unless the payload is exactly GRANT_LEN and the catch says `continue`, and a
+ * COLONY_GENESIS whose scope_id is not `colonyIdFor(author, seq)` is skipped outright.
+ *
+ * Those two facts together were an amplifier. A block typed ROLE_GRANT with a 64 KB payload
+ * carries ZERO authority by the substrate's own computation and was kept forever anyway —
+ * 224x what R4b's comment costs a control block at, from any identity, with no colony
+ * relationship, no standing and no key.
+ *
+ * Asking the same question retention is supposed to be protecting closes it, and it is
+ * convergence-neutral by construction: a block #rebuildAuth skips contributes nothing to
+ * derived authority on ANY replica, so evicting it changes nothing anywhere. It is a pure
+ * function of the block and the log it sits in, which is all a LogReplica has.
+ */
+function countsAsAuthority(logId, seq, b) {
+  if (b.type === TYPE.ROLE_GRANT) return b.payload.length === GRANT_LEN;
+  if (b.type === TYPE.ROLE_REVOKE) return b.payload.length === REVOKE_LEN;
+  if (b.type === TYPE.COLONY_GENESIS) return colonyIdFor(logId, seq).equals(b.scopeId);
+  return false;
+}
 
 export class LogReplica {
   constructor(logId, authorPub) {
@@ -211,7 +236,9 @@ export class LogReplica {
           if (this.claims.length > CLAIMS_CAP) this.claims.shift();
         }
       }
-      if (KEEP_FOREVER.has(b.type)) continue; // authority outlives the byte budget
+      // Authority outlives the byte budget — but only REAL authority. The type byte is
+      // the author's claim; countsAsAuthority is the substrate's own answer.
+      if (KEEP_FOREVER.has(b.type) && countsAsAuthority(this.logId, s, b)) continue;
       this.blocks.delete(s);
       if (s < this.bits.size && this.bits.has(s)) {
         this.bits.bits[s >> 3] &= ~(1 << (s & 7));
