@@ -7,6 +7,7 @@ import { encodeBlock, decodeBlock, logIdFor, newLogId, TYPE, FLAG } from '../src
 import { Substrate, LOST_CAP } from '../src/substrate/store.js';
 import { Syncer } from '../src/sharding/sync.js';
 import { Telemetry } from '../src/telemetry/bus.js';
+import { FetchScheduler, Bitfield } from '../src/sharding/scheduler.js';
 import {
   MSG, encodeHave, decodeHave, encodePairs, decodePairs,
   encodeBlockMsg, decodeBlockMsg, MAX_BODY, MAX_SEQ, WireError,
@@ -1137,4 +1138,39 @@ test('wire: the advertised-set allocation is bounded across ALL logs, not just o
   // And the cap is not in the way of anything real: a million blocks in one log is still
   // expressible, which at ~320 bytes each is already past any phone's storage budget.
   assert.ok(MAX_SEQ >= (1 << 20) - 1, 'a log must still hold ~1M blocks');
+});
+
+test('sharding: the scheduler never asks for a block below our own floor', () => {
+  // Half of a request livelock, and the half that can be tested precisely.
+  //
+  // A replica that evicted [0, floor) clears those HAVE bits. A peer with a bigger budget —
+  // or one that simply has not trimmed yet, which the property tests say is legitimate —
+  // still advertises them. plan() iterated from index 0 and saw "we do not have it, they do",
+  // so it asked. insert() then refused with below_floor, #recvBlock released the reservation
+  // and called pump(), the peer's bit was still set, and plan() asked again.
+  //
+  // That is one full block over the air per RTT, per evicted seq, for as long as both sides
+  // stay connected — and it is reachable by two entirely honest peers. It burns exactly the
+  // airtime the §3.1 experiment is trying to measure, and the harness cannot see it because
+  // the seeder never evicts.
+  const total = 20;
+  const sched = new FetchScheduler(total);
+
+  // We hold nothing, but we have forgotten everything below 10.
+  const have = new Bitfield(total);
+  const floor = 10;
+
+  // One peer who has the lot.
+  const peerHave = new Bitfield(total);
+  for (let i = 0; i < total; i++) peerHave.set(i);
+  const peers = new Map([['deadbeef', { have: peerHave, inflight: new Set(), maxInflight: 32 }]]);
+
+  const plan = sched.plan(have, peers, new Map(), null, 32, floor);
+
+  assert.ok(plan.length > 0, 'it should still want the blocks above the floor');
+  const below = plan.filter((a) => a.index < floor);
+  assert.deepEqual(below, [],
+    `asked for ${below.length} block(s) below the floor — every one of those is a request `
+    + 'that can only be answered with a block insert() will refuse');
+  assert.equal(plan.length, total - floor, 'and it should want all of the ones above it');
 });

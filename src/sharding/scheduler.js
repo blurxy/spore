@@ -107,7 +107,12 @@ export class FetchScheduler {
    * blocks that block from ever being requested again. Asking for more than you will use
    * does not merely waste work — it strands blocks permanently.
    */
-  plan(have, peers, inflightGlobal, counts = null, limit = this.maxPerRound) {
+  /**
+   * `floor` is where OUR replica starts. Below it we have decided to forget, and insert()
+   * refuses anything we ask for down there — so asking is a request that can only ever be
+   * answered with a block we will throw away, at one full block of airtime per attempt.
+   */
+  plan(have, peers, inflightGlobal, counts = null, limit = this.maxPerRound, floor = 0) {
     const assignments = [];
     if (have.complete || limit <= 0) return assignments;
 
@@ -116,7 +121,7 @@ export class FetchScheduler {
 
     // candidate blocks we still need and somebody has, rarest first
     const wanted = [];
-    for (let i = 0; i < this.total; i++) {
+    for (let i = floor; i < this.total; i++) {
       if (!have.has(i) && rank[i] > 0) wanted.push(i);
     }
     wanted.sort((a, b) => rank[a] - rank[b] || a - b);

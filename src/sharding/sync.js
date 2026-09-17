@@ -469,6 +469,22 @@ export class Syncer extends EventEmitter {
 
     if (!res.ok) {
       this.tel?.count(`sync.reject.${res.reason}`);
+      // AND STOP ASKING THIS PEER FOR IT. Releasing the reservation was only half of it: the
+      // peer's HAVE bit still said they had it, plan() would pick it again on the very next
+      // pump(), and pump() is called right here. That is a request loop at RTT rate, one full
+      // block over the air each time, for as long as both sides stay connected.
+      //
+      // Every reason insert() can refuse for is permanent for this (peer, block): a bad
+      // signature or a payload-hash mismatch will not become good, an equivocation will not
+      // un-fork, and below_floor is our own decision that nothing they send can change. The
+      // comment above says a peer must not be able to hold a block hostage by answering
+      // badly forever — it released the hostage and then immediately re-took it.
+      //
+      // The honest case reaches this too, which is why it burns real airtime rather than
+      // only an attacker's: a replica that evicted [0, floor) still hears HAVE for those
+      // seqs from a peer with a bigger budget, and the property tests say held sets
+      // legitimately differ.
+      if (l) this.#forget(l, peer, seq);
       this.pump();
       return;
     }
@@ -608,7 +624,8 @@ export class Syncer extends EventEmitter {
       }
       if (budget <= 0) continue;
 
-      const plan = l.sched.plan(have, l.peers, l.inflightGlobal, null, budget);
+      const plan = l.sched.plan(have, l.peers, l.inflightGlobal, null, budget,
+        replica ? replica.floor : 0);
       if (!plan.length) continue;
 
       // Group by peer so each gets one REQUEST frame instead of one per block. The peer
