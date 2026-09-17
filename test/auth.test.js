@@ -994,3 +994,40 @@ test('review: clamping the floor to a revocation costs ordering — characterise
     'but not orderable — THE COST. If this now reads 9, the ordering problem has been '
     + 'fixed and ARCHITECTURE.md R7 should lose its residual paragraph.');
 });
+
+test("review: 'linked' fires when a late grant unblocks a backlog, not only on the ordinary path", () => {
+  // Same final linkedTo either way; the question is whether the EVENT stream agrees.
+  //
+  // Deliver a member's blocks BEFORE the grant that authorises them exists. Each stalls in
+  // walk two and #relinkAll never promotes it. The grant arrives last, its insert() reaches
+  // AUTHORITY, and #resolveFrontiers — not #relinkAll — is what actually links the backlog.
+  // insert() returns early on that path without ever running the loop that emits 'linked',
+  // and #resolveFrontiers only ever emitted 'retracted', for frontiers that FELL.
+  //
+  // This is not an event-stream nicety. bin/spore.js is the only path messages take to the
+  // screen and it reads this event: a member granted late had their whole backlog delivered
+  // by the substrate and shown to nobody, permanently. The same gap swallows the case where
+  // a fork PROMOTES a log by withdrawing the revocation that stopped it.
+  const c = colony();
+  const g1 = c.grant(0);
+  const m = [0, 1, 2, 3, 4].map((i) => c.mw.push({ payload: Buffer.from(`m${i}`), authRef: g1.hash }));
+
+  const s = new Substrate();
+  const seen = [];
+  s.on('linked', ({ logId, seqs }) => {
+    if (logId.toString('hex') === c.M.logId.toString('hex')) seen.push(...seqs);
+  });
+
+  // Member first — every one of these stalls, because no grant exists yet.
+  load(s, m);
+  assert.equal(s.replica(c.M.logId.toString('hex')).linkedTo, -1, 'nothing can link yet');
+  assert.deepEqual(seen, [], 'and nothing is announced');
+
+  // Now the colony arrives, grant last. This is the #resolveFrontiers path.
+  load(s, [...c.blocks, g1]);
+
+  const mr = s.replica(c.M.logId.toString('hex'));
+  assert.equal(mr.linkedTo, 4, 'the backlog is delivered');
+  assert.deepEqual(seen.sort((a, b) => a - b), [0, 1, 2, 3, 4],
+    'and every delivered block must be announced, whichever path delivered it');
+});

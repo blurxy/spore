@@ -982,6 +982,18 @@ export class Substrate extends EventEmitter {
     }
 
     for (const [r, was] of before) {
+      // A frontier that ROSE. This path used to announce nothing at all, and insert()
+      // returns early on it without running the loop that emits 'linked' — so a member
+      // whose backlog was unblocked by a late grant had it delivered by the substrate and
+      // shown to nobody, permanently. bin/spore.js reads this event and nothing else.
+      // The same silence covered a fork that PROMOTES a log by withdrawing the revocation
+      // that stopped it: the frontier rises, and only falling frontiers were reported.
+      if (r.linkedTo > was) {
+        const seqs = [];
+        for (let x = was + 1; x <= r.linkedTo; x++) if (r.blocks.has(x)) seqs.push(x);
+        if (seqs.length) this.emit('linked', { logId: r.logId, seqs });
+        continue;
+      }
       if (r.linkedTo >= was) continue;
       const seqs = [];
       for (let x = was; x > r.linkedTo; x--) seqs.push(x);
