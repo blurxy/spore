@@ -43,9 +43,22 @@ network.
 
 ## Does it really get faster as people join?
 
-**Yes, and it is now measured rather than derived.** `node bench/curve.js` runs the swarm
-against a token-bucket model with a shared Wi-Fi cell cap, and declares its falsifiers
-*before* the run so the result cannot be rationalised afterwards.
+**In simulation, yes. On real hardware, not yet established — and the simulation may have
+been measuring the wrong thing.** `node bench/curve.js` runs the swarm against a token-bucket
+model with a shared Wi-Fi cell cap, and declares its falsifiers *before* the run so the result
+cannot be rationalised afterwards. That discipline still stands. What follows is the model's
+output, and it is a model.
+
+> **Read `docs/RESULTS-2026-09-17.md` before trusting the curve below.** SPORE has since run on
+> real hardware for the first time, and the run exposed a ceiling in our own request path — six
+> blocks in flight per peer — that sits *inside* the range we measured. `curve.js` models
+> `RTT_MS = 3`, where that ceiling is ~63 MiB/s and therefore invisible to it. So the model and
+> the hardware agreed with each other while plausibly measuring different quantities, which is
+> the worst way for two numbers to agree. Recorded as **R9** in `ARCHITECTURE.md`.
+>
+> The knee below is also quoted as N=5 here and N=4 in `ARCHITECTURE.md` §3.1. That
+> disagreement is unresolved and neither number has hardware behind it: the first real run used
+> two devices, and with one source the shared-cell term never appears at all.
 
 ```
    N   sync     speedup      (50 MB history, real Wi-Fi rates)
@@ -58,7 +71,8 @@ against a token-bucket model with a shared Wi-Fi cell cap, and declares its fals
 ```
 
 `ARCHITECTURE.md` §3 predicted **3.3x saturating near N=5**, from arithmetic, before any
-code existed. Measured: **3.59x saturating at N=5**. All three falsifiers pass:
+code existed. The model returns **3.59x saturating at N=5**. All three of its falsifiers pass —
+which establishes that the model is self-consistent, not that the mesh is:
 
 - capped curve flat from N=5 to N=20 (3.24x → 3.25x) — the medium binds, as predicted
 - uncapped control keeps gaining (4.83x → 5.97x) — so supply really does scale, and the
@@ -119,7 +133,7 @@ the clock before the next local write. It is derived from deps and rejected if a
 which closes the inflation attack.
 
 ```
-npm test                    # 20 tests, zero dependencies
+npm test                    # zero dependencies, and the count is the point of the suite, not this line
 node bench/render-demo.mjs  # the interface, driven by a real handshake
 ```
 

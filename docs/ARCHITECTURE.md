@@ -841,7 +841,10 @@ auto-renewal.
 **4. Substrate** — single-writer hash-chained logs, MMR verification, causal ordering with
 the derived-and-checked Lamport rule, delivery/pending-buffer, the two-pass permission
 resolver calling APP's `authCheck` callback (§2/§4), stability/settled watermarks, fork
-detection. **Added by the correctness review (§1.19, mandatory SP1 scope, not optional):**
+detection. **⚠ SUPERSEDED BY R4 — see below; this paragraph mandates a fix the record later
+proves cannot work, and is kept because the reasoning that failed is the useful part.**
+
+**Added by the correctness review (§1.19, mandatory SP1 scope, not optional):**
 the permission resolver's `auth_ref` must be verified by recomputation against the citing
 block's own `deps`/own-log frontier, not accepted on the author's assertion, and a block whose
 `auth_ref`/lamport gap exceeds a bounded threshold is rejected outright rather than merged —
@@ -1460,12 +1463,20 @@ found.
    addressed and may not be addressable within the zero-npm/off-web constraint.**
 3. **The permission resolver's worked example (`design-substrate.md` §5) demonstrated
    agreement, not safety, and this document originally treated it as proof of both** (§1.19).
-   The fix (`auth_ref` recomputation, bounded staleness rejection) closes the specific replay
-   this review found; whether it closes every variant of "cite a favorable stale state" is a
-   claim this document does not make and has not verified beyond the case traced here.
-   Mitigation: fix adopted in §2/§4; **recommend a further adversarial pass specifically
-   targeting the corrected resolver before treating it as proven, rather than repeating the
-   original mistake of trusting one worked example.**
+   ~~The fix (`auth_ref` recomputation, bounded staleness rejection) closes the specific
+   replay this review found.~~ **Superseded by R4: that fix closes nothing.** Implementing it
+   is what revealed it — V1's attacker picks both the lamport and the dep set, so every rule
+   phrased in terms of either is a rule the attacker satisfies for free. What closes V1 is
+   R4's `pin_seq`, refined by R6 and R7.
+
+   The *recommendation* in this entry was right, and was taken: a further adversarial pass ran
+   against the corrected resolver rather than trusting the worked example. It found **seven
+   fatal bugs**, three of them in the commit that had introduced R6. See R7, R8 and R9.
+
+   The lesson this entry drew — that the worked example demonstrated agreement, not safety —
+   turned out to be narrower than the truth. The property suite asserted that replicas AGREE,
+   and a deterministic logic error makes every replica agree perfectly on the wrong answer. The
+   mistake was not trusting one worked example; it was checking the wrong property.
 4. **Cleartext envelope metadata (log_id, seq, lamport, wall_ms, scope_id, deps, payload_len)
    remains a complete, permanent social graph even after SP2 encryption ships** — encryption
    only hides the message body (§1's crypto-lens finding on metadata leakage, not separately
