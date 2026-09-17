@@ -138,7 +138,11 @@ export class LogReplica {
     // then revoked them stranded their OWN log forever on a dep that could never resolve.
     this.orderedTo = -1;
     this.pendingDeps = false; // frontier is waiting on a dep in another log
-    this.forks = new Map(); // seq -> { kept, other } block hashes
+    // seq -> { a, b, certA, certB } for the LOWEST contradiction in this log, and only it.
+    // Two full certificates, not hashes — the old comment said hashes and was wrong by 8x,
+    // which is presumably why nobody costed it. A proof must be the certs: anyone can verify
+    // one alone, and it cannot be rebuilt from a digest.
+    this.forks = new Map();
     this.forkedAt = Infinity; // lowest seq the author signed twice; the log ends here
   }
 
@@ -988,19 +992,25 @@ export class Substrate extends EventEmitter {
   }
 
   #recordFork(r, seq, keptHash, otherHash, certA, certB) {
-    if (!r.forks.has(seq)) {
-      // The certs, not just the hashes. A fork proof is the two certificates — anyone can
-      // verify it alone — and we cannot produce one later from a digest.
+    const lowered = seq < r.forkedAt;
+    let moved = false; // did a frontier or the floor actually shift?
+
+    // ONE proof per log, and it is the lowest. A log that forked at 3 has ended at 3; a
+    // proof at 7 cannot end it harder and is never the proof anyone needs. Keeping each one
+    // was storing unbounded evidence of a single fact, in a Map nothing bounded — #trim and
+    // forgetOldest only touch r.blocks and r.bytes, so maxBytes never saw it, and two certs
+    // an entry is ~520 bytes, not the 64 the old comment implied.
+    if (lowered || r.forks.size === 0) {
+      r.forks.clear();
       r.forks.set(seq, { a: keptHash, b: otherHash, certA: Buffer.from(certA), certB: Buffer.from(certB) });
     }
-    const lowered = seq < r.forkedAt;
     if (lowered) {
       r.forkedAt = seq;
       // The chain ends at the contradiction as surely as the link does, and authority is
       // read from the chain — so an equivocating owner's control blocks above the fork
       // stop counting, which is the point of stopping the log there at all.
-      if (r.chainTo >= seq) r.chainTo = seq - 1;
-      if (r.orderedTo >= seq) r.orderedTo = seq - 1;
+      if (r.chainTo >= seq) { r.chainTo = seq - 1; moved = true; }
+      if (r.orderedTo >= seq) { r.orderedTo = seq - 1; moved = true; }
 
       // AND THE FLOOR COMES DOWN TOO. Clamping the frontiers here is useless on its own,
       // because #resolveFrontiers resets them to `floor - 1` about two lines later: on a
@@ -1017,16 +1027,27 @@ export class Substrate extends EventEmitter {
         r.floor = seq;
         r.floorHash = null;
         r.floorLamport = 0n;
+        moved = true;
       }
     }
 
     this.tel?.count('substrate.equivocation');
-    const f = r.forks.get(seq);
-    this.emit('equivocation', { logId: r.logId, seq, a: keptHash, b: otherHash, certA: f.certA, certB: f.certB });
+    // From the arguments, not from the map: the map now holds only the lowest proof, which
+    // may not be this one.
+    this.emit('equivocation', { logId: r.logId, seq, a: keptHash, b: otherHash, certA, certB });
 
     // Every frontier, not just this log's. A fork withdraws history other logs may have
     // linked against, and that can cascade further. #recomputeAll emits the retractions.
-    if (lowered) this.#resolveFrontiers(true);
+    //
+    // But ONLY when something actually shifted. `force` exists to bypass R4f's refusal to
+    // rewalk when derived authority is unchanged, and `lowered` alone is a condition an
+    // attacker picks: proofs in DESCENDING seq order are each lower than the last, so each
+    // one bought a full substrate-wide rewalk while nothing could possibly have moved —
+    // R4f's own DoS, reopened one function over, reachable through acceptForkProof, which
+    // sync.js takes from anyone with no rate limit. A fork above everything we hold retracts
+    // nothing and is now free. A fork that genuinely invalidates held history still pays,
+    // because that work is real.
+    if (moved) this.#resolveFrontiers(true);
     return lowered;
   }
 
@@ -1062,7 +1083,10 @@ export class Substrate extends EventEmitter {
     if (!va.ok || !vb.ok) return { ok: false, reason: 'proof_bad_signature' };
 
     const seq = Number(va.block.seq);
-    if (r.forks.has(seq)) return { ok: true, duplicate: true, seq };
+    // At or above a contradiction we already hold, this proof is old news: the log ended
+    // lower down and nothing here can change that. Cheaper and stronger than asking the map
+    // for this exact seq, which now holds only the lowest proof.
+    if (seq >= r.forkedAt) return { ok: true, duplicate: true, seq };
     this.#recordFork(r, seq, va.block.blockHash, vb.block.blockHash, certA, certB);
     return { ok: true, seq };
   }

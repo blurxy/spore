@@ -968,3 +968,68 @@ test('store: a block below the eviction floor is refused, not silently re-admitt
   //    what the leak defeated: every replay used to add bytes with nothing left to evict.
   assert.ok(s.bytes <= s.maxBytes, `over budget: ${s.bytes} > ${s.maxBytes}`);
 });
+
+/** Two different blocks the same author signed at one seq — a real equivocation. */
+function twoAt(id, seq) {
+  const mk = (text) => encodeBlock(
+    {
+      type: TYPE.MESSAGE, flags: FLAG.PAYLOAD_INLINE, logId: id.logId, seq,
+      lamport: seq + 1, prevHash: Buffer.alloc(32), payload: Buffer.from(text),
+    },
+    id.kp.privateKey,
+  ).cert;
+  return [mk(`a${seq}`), mk(`b${seq}`)];
+}
+
+test('store: one fork proof per log, and a proof above the contradiction is free', () => {
+  // A log that forked at seq 3 has ENDED at 3. A proof at seq 7 says nothing further: it
+  // cannot end the log harder, and it cannot be the proof anyone needs. So keeping every
+  // proof was storing unbounded evidence of one fact.
+  //
+  // `forks` had no cap at all — contrast `lost`, capped at LOST_CAP with oldest-out — and
+  // held TWO FULL CERTIFICATES per entry while its own comment said "block hashes", an 8x
+  // undercount that is presumably why nobody looked. #trim and forgetOldest only ever touch
+  // r.blocks and r.bytes, so maxBytes gave zero protection however tight it was set.
+  //
+  // The CPU half was worse. #recordFork forced #resolveFrontiers(true), and `force` exists
+  // precisely to bypass the R4f short-circuit that refuses to rewalk when derived authority
+  // is unchanged. Proofs sent in DESCENDING seq order make every one of them lower forkedAt,
+  // so every one bought a full substrate-wide rewalk — R4f's DoS, reopened one function
+  // over, through acceptForkProof, which sync.js accepts with no rate limit from anyone.
+  const id = identity();
+  const blocks = chain(id, 6);
+  const tel = new Telemetry();
+  const s = new Substrate({ telemetry: tel });
+  for (const b of blocks) s.insert(b.cert, b.payload, id.pub);
+
+  const r = s.replica(id.logId.toString('hex'));
+  assert.equal(r.chainTo, 5, 'the log is real before anyone attacks it');
+
+  // Descending, and every one above anything held. Each lowers forkedAt, so the old code
+  // treated each as `lowered` and forced a rewalk — though nothing could possibly move.
+  const resolvesBefore = tel.counters.get('substrate.resolved') || 0;
+  for (let seq = 2000; seq > 1970; seq--) {
+    const [a, b] = twoAt(id, seq);
+    assert.ok(s.acceptForkProof(a, b, id.pub).ok, `proof at ${seq} should be accepted`);
+  }
+
+  assert.equal(r.forks.size, 1, 'one proof per log — the lowest, which is the only one that ends it');
+  assert.equal(tel.counters.get('substrate.resolved') || 0, resolvesBefore,
+    'and no rewalk, because not one frontier could have moved');
+  assert.equal(s.knownForks().length, 1, 'and only that one is offered to peers');
+
+  // The real thing still works: a fork BELOW what we hold must retract history.
+  const [lowA, lowB] = twoAt(id, 2);
+  assert.ok(s.acceptForkProof(lowA, lowB, id.pub).ok);
+  assert.equal(r.forkedAt, 2, 'the lower contradiction wins');
+  assert.equal(r.chainTo, 1, 'and the chain ends there');
+  assert.equal(r.forks.size, 1, 'still one proof, now the lower one');
+  assert.equal(s.knownForks()[0].seq, 2, 'and it is the one worth relaying');
+  assert.ok((tel.counters.get('substrate.resolved') || 0) > resolvesBefore,
+    'THAT one is worth a rewalk — the gate must not have blocked real work');
+
+  // Re-offering a proof at or above a known contradiction is a duplicate, not new work.
+  const [dupA, dupB] = twoAt(id, 9);
+  assert.equal(s.acceptForkProof(dupA, dupB, id.pub).duplicate, true);
+  assert.equal(r.forks.size, 1);
+});
