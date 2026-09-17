@@ -218,7 +218,9 @@ Expect `DIAL 192.168.1.50:47474` and then `FUSED` within a second or so.
 
 ## 7. The measurement
 
-Now `docs/HARNESS.md` takes over — it has the experiment, the predicted curve, and the one
+`docs/FIRST-RUN.md` is the sheet for the first session — the run order that keeps discovery
+separable from sync, and an explicit list of what two devices can and cannot tell you. Then
+`docs/HARNESS.md` takes over — it has the experiment, the predicted curve, and the one
 line that matters most (the per-source attribution warning). In short:
 
 ```sh
