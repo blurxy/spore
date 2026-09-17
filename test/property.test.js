@@ -303,12 +303,13 @@ test('property: replicas fed the same blocks in any order reach the same state',
     const each = world.blocks[0].cert.length + world.blocks[0].payload.length;
 
     let reference = null;
-    let refFront = null;
+    const built = [];
     for (let k = 0; k < 4; k++) {
       const s = new Substrate({ maxBytes: tight ? each * 8 : 1 << 30 });
       for (const b of shuffled(rng(seed * 100 + k), world.blocks)) {
         s.insert(b.cert, b.payload, b.authorPub);
       }
+      built.push(s);
       // LIVENESS, not just agreement. Two replicas that both stall identically agree
       // perfectly and are both wrong, and `snapshot` cannot tell the difference. A stall
       // is only legitimate when the dep genuinely cannot be ordered — never when the
@@ -385,6 +386,45 @@ test('property: replicas fed the same blocks in any order reach the same state',
       if (tight) continue;
       if (reference === null) reference = snap;
       else assert.equal(snap, reference, `seed ${seed}, shuffle ${k}: replicas diverged`);
+    }
+
+    // FORK PROOFS TRAVEL, and modelling them is what makes "the same blocks" true.
+    //
+    // A fork at a seq a replica has already forgotten cannot be witnessed locally: the
+    // contradicting block arrives, insert() refuses it below_floor, and nothing is left to
+    // compare it against. So one replica ends at forkedAt 4 with its frontier withdrawn to
+    // 3, and another — fed the identical blocks in a different order, having evicted past
+    // 4 before the second one arrived — never learns there was a fork at all.
+    //
+    // That is a real and permanent property of forgetting, not a bug to fix in the store,
+    // and the mesh already answers it: a proof is self-contained evidence anyone can verify,
+    // sync.js replays every one it holds to every new hypha, and acceptForkProof takes them
+    // from any relay. A replica that forgot the evidence learns from one that did not.
+    //
+    // Feeding only blocks therefore models LESS than a real replica receives. Exchanging
+    // proofs before comparing is the honest model, and it is deliberately unconditional:
+    // doing it only for tight seeds would make the harness agree with itself by choosing
+    // when to be realistic.
+    const proofs = [];
+    for (const s of built) proofs.push(...s.knownForks());
+    for (const s of built) {
+      for (const f of proofs) s.acceptForkProof(f.certA, f.certB, f.authorPub);
+    }
+
+    // FRONTIERS ALWAYS, including tight seeds. Which blocks a replica HOLDS legitimately
+    // differs with arrival order under a tight budget — which replica was fattest when the
+    // budget bit decides what it forgot. The frontiers are a different matter: they are
+    // derived from the blocks, the witnesses and the authority set, and every witness this
+    // substrate keeps exists precisely so that forgetting does not change the answer.
+    //
+    // Skipping tight seeds is why the tied-boundary divergence (auth.test.js scenario X)
+    // was invisible here — a tight budget is the only condition under which the eviction
+    // floor can climb past a revocation boundary at all.
+    let refFront = null;
+    for (const s of built) {
+      const front = frontiers(s);
+      if (refFront === null) refFront = front;
+      else assert.equal(front, refFront, `seed ${seed}: frontiers diverged`);
     }
   }
 });
