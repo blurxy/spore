@@ -98,6 +98,14 @@ export const LOST_CAP = 4096;
  * log. Past it the oldest forgotten history keeps the verdict it was delivered under.
  */
 export const CLAIMS_CAP = 256;
+
+/**
+ * The witness remembers this dep, and its log has since forked at or below where it sat.
+ *
+ * Distinct from "never heard of it" (null), because the two demand opposite answers: an
+ * unknown dep may still arrive, a retracted one never becomes valid again.
+ */
+const RETRACTED = Symbol('retracted');
 const KEEP_FOREVER = AUTHORITY;
 
 export class LogReplica {
@@ -214,7 +222,9 @@ export class LogReplica {
       // Remember where it sat, so a citer that has not arrived yet can still be ordered.
       // Bounded, and oldest-out: past the cap a citer genuinely stalls, and that stall is
       // honest — every replica running the same budget forgot the same thing.
-      this.lost.set(b.hash.toString('hex'), b.lamport);
+      // The seq as well as the lamport. Without it the witness cannot be asked the one
+      // question that invalidates it — has this log since forked at or below here?
+      this.lost.set(b.hash.toString('hex'), { lamport: b.lamport, seq: s });
       if (this.lost.size > LOST_CAP) {
         const oldest = this.lost.keys().next().value;
         this.lost.delete(oldest);
@@ -342,16 +352,24 @@ export class LogReplica {
         if (dr) {
           if (!dr.ordered) { stalled = true; break; }
           got.push(dr.lamport);
-        } else if (b.depLamports && i < b.depLamports.length) {
-          got.push(b.depLamports[i]); // we answered this once, while the block was here
-        } else {
-          // Never answered it, because the dep was forgotten before this block arrived.
-          // The substrate may still remember where it sat; that recollection is the only
-          // thing standing between this citer and a permanent, replica-local stall.
-          const recalled = lost(d.deps[i]);
-          if (recalled === null) { stalled = true; break; }
-          got.push(recalled);
+          continue;
         }
+        // THE WITNESS BEFORE THE CACHE. depLamports is what we answered once while the
+        // block was here, and a dep whose log has since forked below it is exactly the case
+        // where that answer is stale — trusting it first let a retraction be laundered by
+        // forgetting. Seed 48: the replica that had evicted the dep kept ordering its citer
+        // while the replica still holding it stalled, on the same blocks.
+        const recalled = lost(d.deps[i]);
+        if (recalled === RETRACTED) { stalled = true; break; }
+        if (recalled !== null) { got.push(recalled); continue; }
+        if (b.depLamports && i < b.depLamports.length) {
+          got.push(b.depLamports[i]); // answered once, and nothing has withdrawn it since
+          continue;
+        }
+        // Never answered, and nothing remembers: a permanent, replica-local stall, and an
+        // honest one — every replica running the same budget forgot the same thing.
+        stalled = true;
+        break;
       }
       if (!stalled) {
         b.depLamports = got;
@@ -432,8 +450,14 @@ export class Substrate extends EventEmitter {
   lostLamport(depHash) {
     const key = Buffer.from(depHash).toString('hex');
     for (const r of this.logs.values()) {
-      const l = r.lost.get(key);
-      if (l !== undefined) return l;
+      const w = r.lost.get(key);
+      if (w === undefined) continue;
+      // A fork at or below where this dep sat withdraws it, and the witness must say so
+      // rather than keep answering. Otherwise forgetting LAUNDERS a retraction: the replica
+      // that still held the dep stalls its citer, and the one that had already forgotten it
+      // goes on ordering against a block on a branch nobody stands behind.
+      if (w.seq >= r.forkedAt) return RETRACTED;
+      return w.lamport;
     }
     return null;
   }
