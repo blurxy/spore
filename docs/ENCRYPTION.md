@@ -1,5 +1,39 @@
 # ENCRYPTION.md — SP2 epoch encryption, reconciled design
 
+> ## Reconciled against the decision record, 2026-09-17 — read this first
+>
+> This document was written before R1 and R4 and contradicts both in places. Two specific
+> defects are fixed inline below (§6 steps 1–2, and two guarantee-table rows). The rest is
+> language, and this banner supersedes it globally rather than by surgery, because rewriting
+> prose that is merely *worded* around an obsolete mechanism risks changing what it means.
+>
+> **Wherever this document appeals to §1.19 — its `auth_ref`/`deps` causal-binding
+> recomputation, its "staleness window", its "lamport-gap window", or a
+> `ROTATE_LAMPORT_WINDOW` "derived from §1.19's own threshold" — none of that exists.**
+> ARCHITECTURE.md R4: *"§1.19's adopted fix does not close §1.19. Implementing it is what
+> revealed that... V1's attacker picks both the lamport and the dep set, so every rule phrased
+> in terms of either is a rule the attacker satisfies for free."* The one field an author
+> cannot choose is their own `seq`, so what shipped is R4's `pin_seq`, refined by **R6** (one
+> ordered list of boundaries, so grants and revocations can never be read by two rules) and
+> **R7** (a claim witness, so a delivery verdict survives eviction).
+>
+> Read every "§1.19-hardened" as "R4/R6/R7-hardened", and every bound expressed as a lamport
+> or staleness window as **unbounded until an honest holder acts** — which is weaker than this
+> document claims, and is the honest statement.
+>
+> **Clause (a)'s narrative** (a demoted author's past rotations "soft-fail", the trigger
+> becoming "re-citable") also predates R4/R6. Under the rule that shipped, a revocation governs
+> from `pin_seq + 1` **in the author's own log**: rotations at or below the pin stay valid,
+> and above it the log *stops* (R6 cost 1). Nothing soft-fails and nothing above the pin
+> delivers at all.
+>
+> **Type numbers below follow design-app.md. The implementation follows design-substrate.md,**
+> which is what R4 says governs. `block.js` is the authority: `MEMBER_JOIN 0x20`,
+> `MEMBER_LEAVE 0x21`, `MEMBER_BAN 0x23`, `ROLE_GRANT 0x24`, `ROLE_REVOKE 0x25`,
+> `FRUITING_CREATE 0x11`. The two schemes also disagree about what `0x11` and `0x12` mean, so
+> a reader who implements from this document's numbers writes blocks the substrate will not
+> recognise.
+
 This document resolves CORRECTNESS.md's four open contradictions (EPOCH_ROTATE authorization,
 the INDEX/FORGE read-capability gate, the late-joiner KEYBUNDLE path, and the untrusted-VAULT
 crux) with concrete mechanisms. It supersedes design-crypto.md's epoch-encryption sections
@@ -201,8 +235,9 @@ Let cut(R) = the state resolved from R's OWN causal cut — the AUTH_SNAPSHOT re
     the owner alone can storm-rotate without limit, same as it always could as owner, and is
     accepted as an owner-trust assumption already implicit everywhere else in the design).
     Otherwise R.deps must cite an ACCEPTED (in resolvedState_final)
-        MEMBER_BAN(0x32) | MEMBER_LEAVE(0x31) | ROLE_REVOKE(0x22, removing VIEW for
-        R.fruiting_id) | FRUITING_OVERRIDE(0x12, removing VIEW)
+        MEMBER_BAN(0x23) | MEMBER_LEAVE(0x21) | ROLE_REVOKE(0x25, removing VIEW for
+        R.fruiting_id) | FRUITING_OVERRIDE(unimplemented; design-app 0x12 collides with
+        design-substrate's 0x11/0x12 range — resolve before use)
     targeting some spore X — OR cite a causal hygiene fact:
         message_count(R.fruiting_id) since the nearest ANCESTOR-ACCEPTED rotation ≥ 100_000
         OR lamport_delta since that ancestor rotation ≥ ROTATE_LAMPORT_WINDOW
@@ -583,7 +618,7 @@ than the message content" self-assessment; do not soften it in product copy.
 | Full forward secrecy + PCS at the hypha/transport layer | **Yes** (unchanged from SP1) | Noise XX `ee`/rehandshake correctness, verified vs. Cacophony vectors | Compromise of both parties' live ephemeral state — untouched by SP2 |
 | Zero-round-trip, out-of-order decryption of any block from any VAULT | **Yes** | Requester already holds `epoch_root` for that block's `epoch_hash` | Requester missed a rotation (partition) with no KEYBUNDLE/supplemental wrap yet |
 | Deterministic, order-independent agreement on which `epoch_hash` is valid | **Yes** | ARCHITECTURE.md **R4**'s `pin_seq` rule is live — NOT §1.19's `auth_ref` recomputation fix, which R4 records as not closing §1.19 at all; `final`/`cut(R)` are pure functions of the delivered block set (§2.1) | A spore that has not yet delivered the same block set — a knowledge gap, not a convergence failure; surfaces as a graceful fork, heals per §2.1 |
-| A rotation citing a ban never wraps the banned member | **Yes** | Wrap-set content check (§2.1 clause d) at the rotation's own causal cut | A ban not yet in the minter's causal cut (bounded by §1.19's staleness window); closed once any honest current holder mints citing the unconsumed ban |
+| A rotation citing a ban never wraps the banned member | **Yes** | Wrap-set content check (§2.1 clause d) at the rotation's own causal cut | A ban not yet in the minter's causal cut. **Unbounded** — the §1.19 staleness window this once cited does not exist (R4). Closed only when some honest current holder mints citing the unconsumed ban, which nothing schedules |
 | Exclusion from *future* content once rotation propagates | **Yes, partition-limited** | Rotation reaches the excluded device's partition; some current BAN/KICK holder notices and mints | An indefinite partition no reachable holder ever notices — named open |
 | `has_read_cap` correctly excludes non-members from INDEX/FORGE candidacy | **Yes** (Layer 1) | Per-fruiting VIEW resolution converges (existing Pass A/B property) | None known — hard, public, keyless precondition |
 | INDEX/FORGE never assigned work it cannot perform | **Best-effort** | Candidate is honest about its own `possess()` self-check | A malicious candidate lying about possession — fails exactly like a slow/crashed peer already does |
@@ -680,19 +715,52 @@ Each step is independently testable against a concrete scenario before the next 
 
    Test: two colonies on one device produce different `wrap_pub`; assert it never equals the
    device's Noise static.
-> **Open, and it must be settled before step 5, not discovered during it.** Are
-> `EPOCH_ROTATE` and `KEYBUNDLE` `KEEP_FOREVER`? They are control blocks and the substrate's
-> instinct is yes. But `KEEP_FOREVER` blocks are exempt from the byte budget, rotations are
-> minted per membership change, and R4c's retention residual is currently bounded by *how
-> much authority a colony writes*. Make rotations unevictable and that residual starts
-> scaling with **membership churn** — at which point it is no longer a residual, it is a
-> growth curve, and R4c's "best-effort in the presence of authority" stops being an honest
-> description. Note also that R4c understates the exposure already: retention is keyed on wire
-> TYPE with no standing check, so any identity can mint retained blocks in its own log.
+> ## Resolved: neither `EPOCH_ROTATE` nor `KEYBUNDLE` is `KEEP_FOREVER`.
 >
-> If the answer is yes, R4c needs rewriting and the byte budget needs a second bound. If the
-> answer is no, rotations must be recoverable from peers after eviction, which is a fetch path
-> that does not exist yet. Neither is hard; picking one after step 5 is built would be.
+> The question was misframed. It assumed retention is keyed on whole-block wire type, which is
+> what `store.js` does — but the design already commits to cert and payload being separately
+> retainable (`design-substrate.md` §1 and §6, `FLAG.REDACTED` in `block.js`, and §1 of this
+> document). Under that split the tension dissolves.
+>
+> **The substrate derives from neither type.** R4b retains exactly the three types
+> `#rebuildAuth` reads. That is a derivation dependency, not a "control block" class. Neither
+> `EPOCH_ROTATE` nor `KEYBUNDLE` is read by `#rebuildAuth` or `#authCheck`, so evicting them
+> moves no frontier, and R4b's laundering argument — forget a revoke and the pin goes with it —
+> has no analogue. The substrate's instinct is "keep" only for what the substrate *computes
+> from*.
+>
+> **The payload cannot cross the wire at design scale anyway.** `MAX_BODY` is 65512 and a wrap
+> entry is 96 bytes, so an `EPOCH_ROTATE` block cannot be sent above ~678 members, and a
+> FROM_GENESIS `KEYBUNDLE` not above ~452 epochs. §2.1 already says the payload is fetched
+> separately from the header; `sync.js` has no such path and `BLOCK` is cert+payload atomic.
+> **The cert/payload split is therefore a step-5 prerequisite regardless of retention**, and it
+> is the same mechanism R7 names as the SP2 storage question. Three problems, one mechanism.
+>
+> **And the DM case settles it on its own.** §2.1: a two-member fruiting rotates on every fresh
+> ephemeral contribution. `KEEP_FOREVER` would make every DM turn's companion rotation
+> unevictable, which makes DM logs unevictable.
+>
+> The cert should survive — `epoch_hash` *is* `block_hash`, cert-only, and later rotations walk
+> it — at R4b's ~290-byte cost class. **Churn-proportional state is unavoidable when membership
+> is a replicated log; the honest line is O(1) per membership event, not O(N), and not inside
+> the substrate's unevictable set.**
+>
+> **There must be no post-eviction fetch path.** `insert()` refuses `seq < floor` deliberately
+> (see the below-floor commit): re-admission below the floor *was* the byte-budget leak, since
+> `forgetOldest` only iterates `[floor, linkedTo)`. Recipients who miss a wrap are served by
+> KEYBUNDLE from any possessor, which §2.3 already designs; verifiers are served by an
+> app-layer witness. Below the floor is decided, not unknown.
+>
+> **Three decisions step 5 will otherwise make by accident**, recorded here so it does not:
+> (1) `KEEP_FOREVER` and `AUTHORITY` are currently the *same Set object*, and `MEMBER_*` /
+> `FRUITING_CREATE` are evictable today while clause (d), `eligible()` and KEYBUNDLE
+> entitlement all read them — they must join `KEEP_FOREVER` **without** joining `AUTHORITY`, so
+> the two must be split before the first `.add()`. (2) This document never says what `auth_ref`
+> an `EPOCH_ROTATE` carries, and `#authCheck` matches scope exactly, so a fruiting-scoped
+> rotation cannot cite a colony-scoped grant — either rotations are colony-scoped with
+> `fruiting_id` in the payload, or grants become per-fruiting. (3) The four-clause check belongs
+> in the KEYRING/app layer consuming `'linked'`, never gating delivery: adding membership
+> semantics to walk two would make delivery depend on blocks that are not retained.
 
 3. **Implement the flat sender-key chain** with `boot_nonce` folded into `sender_root`; do not
    build the GGM tree. Test: derive `message_key(i)` at `i = 0, 1000, 4_000_000` in O(1); confirm
