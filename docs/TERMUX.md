@@ -118,6 +118,51 @@ aggressive OEM battery manager, and Samsung and Xiaomi in particular are worse t
 
 ---
 
+## 3b. Android 12 and newer: the phantom process killer
+
+**This is the one that will waste your evening**, and nothing in this repo can detect it from
+inside — which is exactly why it goes in the runbook rather than in the code.
+
+Android 12 introduced a "phantom process" monitor that SIGKILLs an app's child processes once
+there are more than about 32 of them, and it counts Termux's children. A benchmark run moves
+~13 MB in a burst across many short-lived processes, so the kill lands mid-fetch. What you see
+is a run that stalls and then resumes — **which is indistinguishable from a congested radio**,
+and reads as a finding about the mesh when it is a fact about Android.
+
+Check it:
+
+```sh
+settings get global settings_enable_monitor_phantom_procs
+```
+
+`true` or empty means the killer is active.
+
+Turning it off needs adb or root, so it is device preparation rather than something to do from
+inside Termux:
+
+```sh
+settings put global settings_enable_monitor_phantom_procs false
+settings put global max_phantom_processes 2147483647
+```
+
+While you are there, two more that remove the same class of confound:
+
+```sh
+dumpsys deviceidle whitelist +com.termux      # Doze will not suspend it
+```
+
+and disable any OEM battery manager's reach over Termux — Samsung, Xiaomi and Lenovo all ship
+one that is more aggressive than stock.
+
+**A rooted device is a BETTER measurement node than a stock one**, which is the opposite of the
+usual assumption. Root is what lets these be turned off properly, and every one of them is a
+variable you want out of a radio measurement rather than silently folded into it.
+
+If you cannot turn the killer off, the run is still worth doing — just treat any stall-then-
+resume as suspect until you have checked this, and say so when reporting the numbers.
+
+---
+
 ## 4. On each phone: prove the stack runs here
 
 ```sh
@@ -250,7 +295,7 @@ in the room, and the harness will say so.
 | `Unable to locate package nodejs-lts` | Play Store Termux. Uninstall, get the F-Droid build |
 | `termux-wake-lock: command not found` | `pkg install termux-api`, **and** install the Termux:API app |
 | Phones never see each other | AP isolation, different APs/bands, **or Android multicast receive** — use `--dial` (step 6) to tell them apart |
-| A run stalls and resumes | The wakelock was not held, or an OEM battery manager killed it |
+| A run stalls and resumes | **Check the phantom process killer first** (§3b) — then the wakelock, then an OEM battery manager |
 | `does not look like a v2 bundle file` | Truncated copy. Recopy the bundle |
 | The glass page is blank | Wrong device — `127.0.0.1` means the phone running the spore |
 | Numbers keep climbing past N=5 | **A result.** §3.1 predicts a knee at 4. Report it |

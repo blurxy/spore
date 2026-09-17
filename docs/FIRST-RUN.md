@@ -17,6 +17,10 @@ measure one shared Wi-Fi cell's airtime, which is the term the whole prediction 
 - [ ] AP/client isolation **OFF**. It is on by default on most guest networks.
 - [ ] `termux-wake-lock` held on every phone, screen on. A suspended spore does not fail
       loudly; it stalls mid-fetch and reports a number that is mostly Android's scheduler.
+- [ ] **Android 12+: phantom process killer off.** `settings get global
+      settings_enable_monitor_phantom_procs` must read `false` — see TERMUX.md §3b. It
+      SIGKILLs Termux children past ~32 and the symptom is a stall-then-resume that looks
+      exactly like a congested radio. This is the most expensive thing to miss.
 - [ ] Every device on the same commit. `git bundle verify` on the laptop, `git pull` on each
       phone, and `git log --oneline -1` matching everywhere.
 
