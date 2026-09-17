@@ -1,5 +1,10 @@
 # The first run on real hardware
 
+> **The first session has been run** — see `RESULTS-2026-09-17.md`. Tablet + laptop: 119/119 on
+> Android, multicast discovery works there, uplink 7.5–13.7 MB/s. The knee remains unmeasured
+> and needs four devices. Two lessons are folded back into this sheet below: kill leftover
+> seeders between trials, and take several trials per point because Wi-Fi varies ~1.8x.
+
 `docs/TERMUX.md` gets SPORE onto a phone. `docs/HARNESS.md` describes the experiment and its
 predicted curve. This is the sheet for the **first** session, where the devices are scarce and
 nothing has ever been measured — written to be filled in as you go, because the expensive part
@@ -130,6 +135,12 @@ much earlier and much lower, which §3.1 already expects.
 
 ## Afterwards
 
+- [ ] **`ps -ef | grep node` on every seeder between trials.** A seeder left running from an
+      earlier trial competes for CPU and radio, and the resulting curve declines smoothly —
+      which looks exactly like a finding. This happened on the first run: 11.14 -> 8.77 -> 5.17
+      MB/s was one, two and three seeders, not the mesh.
+- [ ] **Several trials per point.** Wi-Fi varied ~1.8x run to run on a quiet device with the
+      radio pinned out of power-save and zero packet loss. One trial is not a number.
 - [ ] Raw harness output kept per run, not just the summary line.
 - [ ] `node --version` and the commit hash recorded per device.
 - [ ] Anything that halted a step written down verbatim — a runbook that stops on the wrong
