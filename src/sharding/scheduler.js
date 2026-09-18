@@ -73,7 +73,16 @@ export class FetchScheduler {
     this.endgameThreshold = endgameThreshold;
     this.maxDuplicate = maxDuplicate;
     this.maxPerRound = maxPerRound;
-    this.stats = { requests: 0, duplicates: 0, endgameRequests: 0 };
+    // WORK COUNTERS, not performance counters. These exist so a test can assert that the
+    // work done is proportional to what WE hold rather than to what a PEER claims — the
+    // distinction six bugs in this repo have turned on. Wall-clock cannot express that:
+    // the tablet is ~1.8x slower than the laptop, so a timing assertion would flake while
+    // saying nothing about the invariant. See docs/METHOD.md.
+    this.stats = {
+      requests: 0, duplicates: 0, endgameRequests: 0,
+      scanned: 0,     // block indices visited
+      allocBytes: 0,  // bytes of index/bitfield allocation charged at the site
+    };
   }
 
   /**
@@ -83,6 +92,8 @@ export class FetchScheduler {
    */
   rarity(have, peers) {
     const counts = new Int32Array(this.total).fill(-1);
+    this.stats.allocBytes += this.total * 4;
+    this.stats.scanned += this.total;
     for (let i = 0; i < this.total; i++) {
       if (have.has(i)) continue;
       let n = 0;
@@ -121,6 +132,7 @@ export class FetchScheduler {
 
     // candidate blocks we still need and somebody has, rarest first
     const wanted = [];
+    this.stats.scanned += Math.max(0, this.total - floor);
     for (let i = floor; i < this.total; i++) {
       if (!have.has(i) && rank[i] > 0) wanted.push(i);
     }

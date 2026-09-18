@@ -154,6 +154,10 @@ export class Syncer extends EventEmitter {
     this.stats = {
       requested: 0, served: 0, received: 0, noblock: 0, cancelled: 0, timedOut: 0, released: 0,
       fromPeer: new Map(),
+      // Bytes of bitfield allocation charged at the site. A WORK counter, not a perf one:
+      // it exists so a test can assert allocation scales with what we hold rather than with
+      // what a peer claims. See docs/METHOD.md and scheduler.js stats.
+      allocBytes: 0,
     };
 
     // Forks we have already told the mesh about, keyed `logHex:seq`. Bounded by the
@@ -414,6 +418,7 @@ export class Syncer extends EventEmitter {
       if (!l) continue; // at the log cap
       let p = l.peers.get(peer);
       if (!p) {
+        this.stats.allocBytes += Math.ceil((seq + 1) / 8);
         p = { have: new Bitfield(seq + 1), inflight: new Set(), maxInflight: this.maxInflightPerPeer };
         l.peers.set(peer, p);
         if (!this.peerInflight.has(peer)) this.peerInflight.set(peer, 0);
@@ -627,6 +632,7 @@ export class Syncer extends EventEmitter {
       if (total <= 0) continue;
 
       // Our own have-set, sized to the longest log anyone knows about.
+      if (!replica) this.stats.allocBytes += Math.ceil(total / 8);
       const have = replica ? replica.bits : new Bitfield(total);
       if (have.size < total) have.grow(total);
       l.sched.total = total;

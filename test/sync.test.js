@@ -1185,3 +1185,87 @@ test('sharding: the scheduler never asks for a block below our own floor', () =>
     + 'that can only be answered with a block insert() will refuse');
   assert.equal(plan.length, total - floor, 'and it should want all of the ones above it');
 });
+
+/** One HAVE_ADD frame claiming `n` distinct logs, each at `seq`. Well-formed throughout. */
+function haveAddFrame(n, seq, saltByte) {
+  const body = Buffer.alloc(3 + n * 20);
+  body.writeUInt8(MSG.HAVE_ADD, 0);
+  body.writeUInt16LE(n, 1);
+  for (let i = 0; i < n; i++) {
+    const at = 3 + i * 20;
+    Buffer.alloc(16, saltByte).copy(body, at);
+    body.writeUInt16LE(i, at); // distinct log ids, same salt
+    body.writeUInt32LE(seq, at + 16);
+  }
+  return body;
+}
+
+test('sync: work is proportional to what WE hold, not to what a peer CLAIMS', {
+  // EXPECTED TO FAIL until the window bound lands (ARCHITECTURE R10). Measured on the code
+  // as it stands: 55 MiB of counted work when peers claim head 1000, and 32,856 MiB when
+  // they claim MAX_SEQ — a 1049x larger claim buying ~600x more of our work, from three
+  // peers and a few small frames.
+  //
+  // Marked todo rather than deleted or weakened, because the whole point of this test is to
+  // be RED before the fix and green after. A test written after the fix is written to match
+  // the fix; that is how R7's clamp shipped twice and was wrong twice.
+  todo: 'window bound not implemented — see ARCHITECTURE R10',
+}, async () => {
+  // THE COST ORACLE. Six bugs in this repo have turned on one distinction: a quantity sized
+  // by a number the peer chooses, rather than by one we hold. forks, KEEP_FOREVER, MAX_SEQ,
+  // dep_count, rarity(), and MAX_SEQ again. Each time the bound was placed on the number and
+  // never on the product — see docs/METHOD.md.
+  //
+  // So this asserts the INVARIANT rather than a threshold: drive identical victim state
+  // twice, once with peers claiming a modest head and once with them claiming MAX_SEQ, and
+  // require the work done to be within a constant factor. A threshold would need a number
+  // nobody has justified yet; an invariance test needs only that the bound EXIST.
+  //
+  // Counted work, never wall-clock. The tablet is ~1.8x slower than this laptop, so a timing
+  // assertion would flake while saying nothing about the property. Nor heapTotal, which is
+  // GC noise — the existing hostile-HAVE_ADD test uses it because it only needs to catch a
+  // 512 MB spike, and that is a different question from this one.
+  const LOGS = 12;
+
+  const run = async (claimedSeq, basePort) => {
+    const victim = spore(basePort);
+    const hostiles = [spore(basePort + 1), spore(basePort + 2), spore(basePort + 3)];
+    for (const sp of [victim, ...hostiles]) await sp.mgr.listen();
+    victim.sync.start();
+
+    let salt = 0x40;
+    for (const hostile of hostiles) {
+      const h = await hostile.mgr.dial({ sporeId: victim.id.pub, addrs: ['127.0.0.1'], tcpPort: basePort });
+      assert.ok(h, 'dial must succeed');
+      h.send(haveAddFrame(LOGS, claimedSeq, salt));
+      // NOBLOCK naming the same pairs. #recvNoblock forgets any pair, asked-for or not, and
+      // that is what turned a one-off cost into a per-pump one.
+      const nb = haveAddFrame(LOGS, claimedSeq, salt);
+      nb.writeUInt8(MSG.NOBLOCK, 0);
+      h.send(nb);
+      salt += 1;
+    }
+
+    // Let the frames land and a few pump() cycles run.
+    await new Promise((r) => setTimeout(r, 120));
+
+    const work = victim.sync.stats.allocBytes
+      + [...victim.sync.logs.values()].reduce((a, l) => a + l.sched.stats.allocBytes + l.sched.stats.scanned * 4, 0);
+
+    victim.sync.stop();
+    for (const sp of [victim, ...hostiles]) await sp.mgr.stop();
+    return work;
+  };
+
+  const modest = await run(1000, 47780);
+  const maximal = await run(MAX_SEQ, 47790);
+
+  // Within a constant factor. Generous on purpose: the point is that it does not scale WITH
+  // the claimed number, and MAX_SEQ/1000 is a ratio of ~1048x.
+  assert.ok(
+    maximal <= modest * 8 + (1 << 20),
+    `work scaled with the peer's claim: ${(modest / 1024).toFixed(0)} KiB at head 1000 versus `
+    + `${(maximal / 1048576).toFixed(1)} MiB at MAX_SEQ — a ${(MAX_SEQ / 1000).toFixed(0)}x `
+    + 'larger claim must not buy a proportionally larger amount of our work',
+  );
+});
