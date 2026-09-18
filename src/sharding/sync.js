@@ -43,6 +43,30 @@ import { CERT_MIN } from '../substrate/store.js';
 export const MAX_INFLIGHT_PER_PEER = 6;
 
 /**
+ * How far above our own delivery frontier we will look for blocks to fetch.
+ *
+ * DELIBERATELY NON-BINDING, and the number is a derivation rather than a tuning. The window
+ * must hold at least `maxInflight x sources` requestable blocks or sources sit idle with
+ * slots free: at `--inflight 24` and eight sources that is 192, and 512 clears it by 2.6x.
+ *
+ * It exists because `rarity()` and the per-peer bitfields were sized from the largest head
+ * any PEER claimed, which is a number we do not control — three peers claiming MAX_SEQ bought
+ * ~600x more work than three claiming head 1000 (see the cost oracle in test/sync.test.js).
+ * A window above `linkedTo` bounds the scan, the allocation and the unlinked retention
+ * together, because all three were sized by the same untrusted quantity. ARCHITECTURE R10.
+ *
+ * The two failure directions are NOT symmetric, which is why a default is defensible before
+ * the number has been measured. Too small is a throughput ceiling that would make the harness
+ * measure this constant instead of the radio — R9's shape, and the reason `stats.windowStarved`
+ * exists to detect it on every ordinary run. Too large only loosens a memory bound, and any
+ * finite value satisfies the oracle's invariance property.
+ *
+ * What would prove this default wrong: `windowStarved > 0` on any run where sources sat idle,
+ * or a netem sweep finding the knee above 512 for an asymmetry the product claims to support.
+ */
+export const FETCH_WINDOW = 512;
+
+/**
  * The most logs one spore will track for peers.
  *
  * Nothing authorises a log into existence — any authenticated peer can name one in a
@@ -112,6 +136,7 @@ export class Syncer extends EventEmitter {
     substrate, hyphaManager, telemetry = null, selfPub, selfLogId,
     requestTimeoutNs = REQUEST_TIMEOUT_NS,
     maxInflightPerPeer = MAX_INFLIGHT_PER_PEER,
+    fetchWindow = FETCH_WINDOW,
   }) {
     super();
     this.store = substrate;
@@ -137,6 +162,9 @@ export class Syncer extends EventEmitter {
     // discriminator; sweeping block size is confounded, because larger blocks also reduce
     // per-byte receive cost.
     this.maxInflightPerPeer = maxInflightPerPeer;
+    // See FETCH_WINDOW. Injectable so the netem harness can sweep it without a code change —
+    // and so that sweeping it is how the default gets justified, rather than an argument.
+    this.fetchWindow = fetchWindow;
 
     this.logs = new Map(); // logIdHex -> LogSync
     this.peerInflight = new Map(); // peerHex -> total outstanding across all logs
@@ -158,6 +186,11 @@ export class Syncer extends EventEmitter {
       // it exists so a test can assert allocation scales with what we hold rather than with
       // what a peer claims. See docs/METHOD.md and scheduler.js stats.
       allocBytes: 0,
+      // Rounds where the window was the binding constraint: budget to spend, nothing
+      // requestable inside it. THE FALSIFIER for FETCH_WINDOW's default — if this is ever
+      // nonzero while sources sit idle, the window is too small and the measurement it
+      // produces is of this constant rather than of the network.
+      windowStarved: 0,
     };
 
     // Forks we have already told the mesh about, keyed `logHex:seq`. Bounded by the
@@ -416,6 +449,29 @@ export class Syncer extends EventEmitter {
     for (const { logId, seq } of decodePairs(body)) {
       const l = this.#log(logId, null);
       if (!l) continue; // at the log cap
+
+      // THE ONE SITE SIZED FROM A BARE PEER NUMBER BEFORE ANY REPLICA EXISTS, which is why
+      // it needs its own bound rather than inheriting pump()'s. A HAVE_ADD pair carries a
+      // seq and nothing else, and both the allocation below and the grow beneath it come
+      // straight off it.
+      //
+      // LOOKAHEAD is generous on purpose and is a DIFFERENT trade from the fetch window: it
+      // buys bytes per (log, peer) against how far ahead a relay may legitimately be before
+      // its announcements are dropped and the 10 s HAVE_REFRESH becomes the repair path.
+      // Two tests depend on that path being unnecessary — a spore that caches on fetch and
+      // one that connects while empty both discover their source ONLY through HAVE_ADD, on
+      // budgets shorter than a refresh interval.
+      //
+      // Beyond the cap the pair is SKIPPED, not fatal. An honest relay one window ahead of
+      // us does this routinely, and closing the hypha over it would punish the common case.
+      {
+        const rep = this.store.replica(l.key);
+        const base = rep ? Math.max(rep.linkedTo + 1, rep.floor) : 0;
+        if (seq >= base + this.fetchWindow * 8) {
+          this.tel?.count('sync.have_add.beyond_window');
+          continue;
+        }
+      }
       let p = l.peers.get(peer);
       if (!p) {
         this.stats.allocBytes += Math.ceil((seq + 1) / 8);
@@ -638,12 +694,24 @@ export class Syncer extends EventEmitter {
       const total = this.#totalFor(l, replica);
       if (total <= 0) continue;
 
-      // Our own have-set, sized to the longest log anyone knows about.
-      if (!replica) this.stats.allocBytes += Math.ceil(total / 8);
-      const have = replica ? replica.bits : new Bitfield(total);
-      if (have.size < total) {
-        this.stats.allocBytes += Math.ceil(total / 8) - Math.ceil(have.size / 8);
-        have.grow(total);
+      // TWO DIFFERENT QUANTITIES, conflated until R10. `total` is the claimed LENGTH: an
+      // O(1) number, correct for progress, completion and the endgame ratio, and it keeps
+      // being assigned to sched.total for exactly those. `end` is the EXTENT WE WILL LOOK
+      // AT, and that is what must not be sized by a head a peer chose.
+      const base = replica ? Math.max(replica.linkedTo + 1, replica.floor) : 0;
+      const end = Math.min(total, base + this.fetchWindow);
+      if (end <= base) continue;
+
+      // Above linkedTo, never above head: an author who pushes one block at a huge seq moves
+      // `head`, and a head-relative window would skip the entire middle of their log.
+      if (!replica) this.stats.allocBytes += Math.ceil(end / 8);
+      const have = replica ? replica.bits : new Bitfield(end);
+      // Grow to `end`, and do not drop this: a replica holding exactly [0, L] has
+      // size === count, so a have-set left unsized reads as COMPLETE and plan() returns
+      // nothing — the sync stalls at the held count with no error, timeout or NOBLOCK.
+      if (have.size < end) {
+        this.stats.allocBytes += Math.ceil(end / 8) - Math.ceil(have.size / 8);
+        have.grow(end);
       }
       l.sched.total = total;
 
@@ -658,9 +726,13 @@ export class Syncer extends EventEmitter {
       }
       if (budget <= 0) continue;
 
-      const plan = l.sched.plan(have, l.peers, l.inflightGlobal, null, budget,
-        replica ? replica.floor : 0);
-      if (!plan.length) continue;
+      const plan = l.sched.plan(have, l.peers, l.inflightGlobal, null, budget, base, end);
+      if (!plan.length) {
+        // Budget to spend and nothing requestable inside the window. Either we hold it all,
+        // or the window is the binding constraint — and the second is the one worth knowing.
+        if (budget > 0 && end < total) this.stats.windowStarved += 1;
+        continue;
+      }
 
       // Group by peer so each gets one REQUEST frame instead of one per block. The peer
       // budget is charged HERE, at reservation time, not after a successful send: plan()

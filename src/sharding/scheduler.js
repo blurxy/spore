@@ -90,15 +90,21 @@ export class FetchScheduler {
    * O(blocks x peers) — correct but quadratic, so callers running many spores should
    * maintain replica counts incrementally and pass them in as `counts`.
    */
-  rarity(have, peers) {
-    const counts = new Int32Array(this.total).fill(-1);
-    this.stats.allocBytes += this.total * 4;
-    this.stats.scanned += this.total;
-    for (let i = 0; i < this.total; i++) {
+  rarity(have, peers, from = 0, to = this.total) {
+    // Sized to the EXTENT WE WILL LOOK AT, not to the largest head any peer claims. That
+    // number is chosen by the peer, and an Int32Array sized from it is 4 bytes per claimed
+    // block — the single largest allocation in this codebase driven by an untrusted value.
+    //
+    // `counts` is indexed from `from`, so callers index `rank[i - from]`.
+    const span = Math.max(0, to - from);
+    const counts = new Int32Array(span).fill(-1);
+    this.stats.allocBytes += span * 4;
+    this.stats.scanned += span;
+    for (let i = from; i < to; i++) {
       if (have.has(i)) continue;
       let n = 0;
       for (const p of peers.values()) if (p.have.has(i)) n++;
-      counts[i] = n;
+      counts[i - from] = n;
     }
     return counts;
   }
@@ -123,20 +129,27 @@ export class FetchScheduler {
    * refuses anything we ask for down there — so asking is a request that can only ever be
    * answered with a block we will throw away, at one full block of airtime per attempt.
    */
-  plan(have, peers, inflightGlobal, counts = null, limit = this.maxPerRound, floor = 0) {
+  plan(have, peers, inflightGlobal, counts = null, limit = this.maxPerRound, floor = 0, to = this.total) {
     const assignments = [];
     if (have.complete || limit <= 0) return assignments;
 
-    const rank = counts || this.rarity(have, peers);
+    const rank = counts || this.rarity(have, peers, floor, to);
+    const rankFrom = counts ? 0 : floor; // caller-supplied counts are absolute-indexed
+
+    // AGAINST this.total, NOT against the window edge. If this denominator were the window,
+    // then on any log longer than the window `have.count` would approach it by construction
+    // and the ratio would tend to 1 — endgame permanently on, every block requested up to
+    // maxDuplicate times and cancelled after the fact. Silent 3x airtime on long logs, and
+    // invisible on a 400-block harness because the window never binds there.
     const endgame = have.count / this.total >= this.endgameThreshold;
 
     // candidate blocks we still need and somebody has, rarest first
     const wanted = [];
-    this.stats.scanned += Math.max(0, this.total - floor);
-    for (let i = floor; i < this.total; i++) {
-      if (!have.has(i) && rank[i] > 0) wanted.push(i);
+    this.stats.scanned += Math.max(0, to - floor);
+    for (let i = floor; i < to; i++) {
+      if (!have.has(i) && rank[i - rankFrom] > 0) wanted.push(i);
     }
-    wanted.sort((a, b) => rank[a] - rank[b] || a - b);
+    wanted.sort((a, b) => rank[a - rankFrom] - rank[b - rankFrom] || a - b);
 
     for (const index of wanted) {
       if (assignments.length >= limit) break;

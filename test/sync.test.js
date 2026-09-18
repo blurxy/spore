@@ -1139,16 +1139,21 @@ test('wire: the advertised-set allocation is bounded across ALL logs, not just o
   // expressible, which at ~320 bytes each is already past any phone's storage budget.
   assert.ok(MAX_SEQ >= (1 << 20) - 1, 'a log must still hold ~1M blocks');
 
-  // WHAT THIS TEST DOES NOT BOUND, said here because the last comment that left it unsaid is
-  // the reason this test exists. #recvHaveAdd allocates per (log, PEER), and nothing caps the
-  // number of connected hyphae — so the real worst case is the figure above times the peer
-  // count, and this assertion covers one peer's share of it.
+  // WHERE THE RESIDUAL LIVES NOW, updated when the window landed rather than left to point
+  // at a function that is no longer the problem.
   //
-  // It cannot be fixed by lowering MAX_SEQ further: the multiplier is a quantity we do not
-  // control, and a bound that depends on an attacker's restraint is not a bound. The fix is a
-  // window above our own linkedTo, which bounds the scan, the allocation and the unlinked
-  // bytes together. Until that lands this is a partial bound, and saying so is the point.
-  assert.ok(worst * 2 > worst, 'per-peer multiplier is unbounded — see the comment above');
+  // #recvHaveAdd used to allocate per (log, PEER) straight from a claimed seq, so the worst
+  // case was this figure times an uncapped hypha count. It is now capped at 8x the fetch
+  // window above our own frontier, and the cost oracle asserts the invariant directly.
+  //
+  // What is still unbounded is #recvHave: it allocates from `bitlen`, but decodeHave refuses
+  // a frame that does not actually carry ceil(bitlen/8) bytes, so that allocation is 1:1
+  // with bytes the peer paid for and is bounded per frame by MAX_BODY. The residual is
+  // RETAINED bits across peers — roughly MAX_LOGS x MAX_BODY per peer — and the fix is a
+  // per-peer advertised-bytes budget, not a smaller MAX_SEQ. Deliberately not clamped: a
+  // joiner that learns bits only to a cap stalls until the 10 s refresh, which would pause
+  // the harness every couple of windows.
+  assert.ok(MAX_SEQ > 0, 'residual documented above — see #recvHave, not #recvHaveAdd');
 });
 
 test('sharding: the scheduler never asks for a block below our own floor', () => {
@@ -1213,7 +1218,6 @@ test('sync: work is proportional to what WE hold, not to what a peer CLAIMS', {
   // Marked todo rather than deleted or weakened, because the whole point of this test is to
   // be RED before the fix and green after. A test written after the fix is written to match
   // the fix; that is how R7's clamp shipped twice and was wrong twice.
-  todo: 'window bound not implemented — see ARCHITECTURE R10',
 }, async () => {
   // THE COST ORACLE. Six bugs in this repo have turned on one distinction: a quantity sized
   // by a number the peer chooses, rather than by one we hold. forks, KEEP_FOREVER, MAX_SEQ,

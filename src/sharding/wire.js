@@ -91,8 +91,13 @@ const PAIR = LOG_ID + 4; // (log_id, seq)
 //
 // So this constant does NOT bound the advertised-set allocation. It bounds one peer's share
 // of it. The real bound has to come from OUR frontier rather than from a limit on what a peer
-// may claim, because the multiplier is a quantity we do not control. Recorded in
-// docs/RESULTS-2026-09-17.md; the fix is a window above linkedTo, not a smaller MAX_SEQ.
+// may claim, because the multiplier is a quantity we do not control.
+//
+// THAT BOUND NOW EXISTS: FETCH_WINDOW in sync.js, a window above linkedTo, which caps the
+// scan in rarity(), the per-(log, peer) allocation in #recvHaveAdd, and the extent plan()
+// considers. MAX_SEQ remains worth keeping low — it is the ceiling on a single frame's
+// demand and on LogReplica#bits — but it is no longer the thing standing between an
+// unauthenticated frame and a gigabyte. ARCHITECTURE R10.
 export const MAX_SEQ = 0xfffff;
 
 export class WireError extends Error {
