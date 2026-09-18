@@ -577,7 +577,7 @@ export class Syncer extends EventEmitter {
   // --- the pump -------------------------------------------------------------------
 
   #freeSlots(peer) {
-    return Math.max(0, MAX_INFLIGHT_PER_PEER - (this.peerInflight.get(peer) || 0));
+    return Math.max(0, this.maxInflightPerPeer - (this.peerInflight.get(peer) || 0));
   }
 
   /**
