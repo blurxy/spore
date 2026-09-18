@@ -110,6 +110,11 @@ resilience fallback — have zero Node stdlib API at all.
 
 **Fix, adopted as scope, not as a promised capability:** SP1's supported platform is Node 24
 on a laptop/desktop/Raspberry-Pi-class device — Windows, macOS, Linux. "Works on a phone
+
+> **Caveat, 2026-09-17:** development is moving to Linux. Windows support is a real claim —
+> `beacon.js` carries a Windows-only EINVAL branch that exists because someone hit it — but it
+> becomes an *untested* claim the moment nobody runs `npm test` there. Either keep a periodic
+> Windows run, or drop the platform from this line. Do not leave it asserted and unexercised.
 hotspot" for SP1 means **a laptop joined to a phone's hotspot AP**, which needs nothing
 beyond the TCP/UDP LAN transport already designed and probe-verified. A phone *as a spore*
 (the literal handheld device running SPORE) requires a native platform shell — an iOS
@@ -1320,6 +1325,66 @@ an oracle now checks the frontier against a second, deliberately naive reading o
 rule list. It is a regression oracle, not a discovery oracle: it catches a CONSUMER
 diverging from the rule the PRODUCER built, which is what this bug was. If R6 itself is
 wrong, both readings are wrong together and it stays silent.
+
+**R10. What is held above the frontier has a lifetime, and SP1 has a stop rule.** Two
+decisions the project had never made, found by an advisor pass that was asked what the session
+was systematically avoiding rather than what was next on the list. Neither was deferred or
+disputed. Neither had been raised.
+
+*The lifetime of held-but-unlinked state.* `forgetOldest` iterates `[floor, linkedTo)`, so
+nothing above the delivery frontier is evictable or counted — and `test/sync.test.js` asserts
+`bytes > budget` as the CORRECT outcome for a substrate of unlinked blocks. Separately,
+`rarity()` scans `this.total`, which `#totalFor()` sets from the largest head any PEER claims,
+and `#recvHaveAdd` allocates a Bitfield per (log, peer) from the same claimed number.
+
+**These are one bound, not three.** Every one of them is sized by a number the peer chooses
+rather than one we hold. That is why lowering `MAX_SEQ` could not fix it and never will: the
+multiplier is a quantity we do not control, and a bound that depends on an attacker's restraint
+is not a bound. Three candidates were considered:
+
+> (a) **Distance from the frontier.** Never request, and never retain, more than a window `W`
+> above `linkedTo` per log; evict farthest-first. Bounds the scan, the allocation and the
+> unlinked bytes together.
+> (b) **Bytes only.** Count unlinked blocks against `maxBytes` and evict them, farthest above
+> the frontier first, before any linked history.
+> (c) **The delivering hypha's lifetime.** Rejected: an honest late joiner loses partial
+> fetches when a peer withers, which is the common case rather than the adversarial one.
+
+**Adopted: (a) and (b) together.** There is no clock in this substrate and there is not going
+to be one, so a lifetime has to be expressed in blocks or bytes. (a) alone leaves the cross-log
+multiplier — `W` per log still multiplies by `MAX_LOGS` — and (b) alone leaves the scan cost,
+which is CPU rather than memory. **`W` itself is deliberately not fixed here**, because it caps
+parallel fetch depth and therefore trades against the product claim that distant blocks can be
+fetched at once from different peers. It must be justified against the 400-block harness and
+against honest colony scale, not chosen to make a test pass.
+
+*The lifetime of SP1 itself.* Every adversarial pass this project has run has found more fatal
+bugs, and the list has never had a terminating rule. "Keep hardening until the advisor stops
+finding things" is not a condition — it is a description of an unbounded loop, and it is what
+the last several sessions have actually been doing.
+
+> **SP1 is done when:** (i) every attacker-chosen number that sizes an allocation or a scan —
+> `seq`, `bitlen`, `dep_count`, log count, peer count, claimed head — has a test asserting that
+> work scales with what WE hold rather than with what a peer claims; (ii) nothing published
+> rests on `bench/curve.js` alone; (iii) the knee is either measured on four devices or
+> declared unmeasured in every place it is quoted.
+
+Not "when it is bug-free". Condition (i) is the one that generalises: the five instances of
+this project's signature failure — `forks`, `KEEP_FOREVER`, `MAX_SEQ`, `dep_count`, `rarity()`
+— are all the same sentence, which is that **the bound was placed on the number and not on the
+product.** The check is a test that multiplies.
+
+*A caveat on the whole frame, recorded because it outranks the rest.* The eviction machinery
+this decision governs — R4b through R7, `floorHash`, `floorLamport`, `lost`, `claims`,
+`#forgottenStop` — defends a process that runs long enough to accumulate `MAX_BYTES`. For text
+traffic `docs/RESULTS-2026-09-17.md` puts that at roughly 150–220K messages colony-wide.
+Meanwhile `bin/spore.js` regenerates the identity on every launch, nothing in `src/` writes
+anything to disk, and `docs/TERMUX.md` records that the target platform kills the process
+routinely. **So the subsystem this project has worked hardest on protects state that the
+platform's ordinary behaviour destroys first**, and a founder who restarts loses their colony,
+because `colony_id` is bound to the founder's `log_id`. Persistence appears in no §5 item and
+in no deferred list. It is not a residual; it was invisible. SP2 step 1 is blocked on it
+regardless, since `wrap_seed` derives from a `master_seed` assumed to be at rest.
 
 **R9. The first hardware measurement may be measuring us, not the radio.** `docs/RESULTS-2026-09-17.md`
 records SPORE running on an Android tablet: 119/119 unmodified, multicast discovery working,
