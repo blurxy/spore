@@ -1403,7 +1403,33 @@ is not a bound. Three candidates were considered:
 > fetches when a peer withers, which is the common case rather than the adversarial one.
 
 **Adopted: (a) and (b) together.** There is no clock in this substrate and there is not going
-to be one, so a lifetime has to be expressed in blocks or bytes. (a) alone leaves the cross-log
+to be one, so a lifetime has to be expressed in blocks or bytes.
+
+> **Correction, same day, on implementing (b): eviction is the wrong instrument and (b) as
+> worded above is wrong.** It says to evict unlinked blocks farthest-above-frontier first. The
+> suite refused it in one run, and the test that refused it has the better argument —
+> *"unlinked blocks are never evicted, because they are why the frontier moves."* Twenty-nine
+> blocks arriving with a gap at seq 0 link nothing, sit over budget, and are honest about it;
+> when seq 0 arrives all twenty-nine link, **because they were still there.** Evicting them
+> means a closing gap links nothing and sync can never complete under a tight budget.
+>
+> The resolution is to **refuse at `insert()` rather than accept and then drop.** A refusal is
+> convergence-neutral — it says "not received yet", which is already true of every block we
+> have not seen — while an eviction destroys work that was about to pay off. That is the same
+> argument this record made for `MAX_SEQ`, one layer up.
+>
+> **The cap itself is an open decision, not an implementation detail.** It cannot be `maxBytes`:
+> the existing test deliberately holds 29 unlinked blocks against a five-block budget and
+> asserts that being over budget is CORRECT there. So the number has to be justified against
+> what an honest joiner legitimately accumulates mid-sync, which is bounded by the fetch
+> window for blocks we requested and unbounded only for blocks pushed unsolicited. The shape
+> is probably a per-replica unlinked-bytes cap generous enough that honest sync never meets
+> it, with a telemetry counter when it does.
+>
+> Recorded rather than built, because writing a second design on top of a reverted patch at
+> the end of a long session is how the one-fix-in-three rate is earned. **(a) has shipped**
+> — see the fetch window — and it bounds everything we REQUEST. What remains unbounded is
+> what a peer pushes at us unsolicited. (a) alone leaves the cross-log
 multiplier — `W` per log still multiplies by `MAX_LOGS` — and (b) alone leaves the scan cost,
 which is CPU rather than memory. **`W` itself is deliberately not fixed here**, because it caps
 parallel fetch depth and therefore trades against the product claim that distant blocks can be
