@@ -1273,3 +1273,81 @@ test('sync: work is proportional to what WE hold, not to what a peer CLAIMS', {
     + 'larger claim must not buy a proportionally larger amount of our work',
   );
 });
+
+test('sync: a log longer than any fetch window still completes, because the window SLIDES', async () => {
+  // WRITTEN BEFORE THE WINDOW EXISTS, on purpose. It passes today for the trivial reason
+  // that nothing is bounded, and its job is to fail the day a window is added without one.
+  //
+  // ARCHITECTURE R10 adopts a window W above linkedTo: never request, and never retain, more
+  // than W blocks past the frontier. That bounds the scan, the allocation and the unlinked
+  // bytes together — all three are sized by a head the PEER claims rather than one we hold.
+  //
+  // The thing it must not break is this: a log longer than W must still sync to completion,
+  // because the window advances as linkedTo does. A window that is computed once, or from a
+  // frontier that is read before the walk rather than after it, produces a joiner that
+  // fetches exactly W blocks and then stops forever — with no error, no timeout and no
+  // NOBLOCK, because from the scheduler's point of view there is simply nothing it wants.
+  //
+  // That failure is silent, which is why the guard is written now rather than after. The
+  // product claim R10 says W trades against is parallel fetch DEPTH; this is the separate
+  // claim that fetch LENGTH is unbounded, and the two are easy to conflate while choosing W.
+  const author = identity();
+  const LONG = 300; // longer than any window a sane person picks for a 400-block harness
+  const blocks = chain(author, LONG, 'long');
+
+  const seeder = spore(47800, { seedFrom: { id: author, blocks } });
+  const joiner = spore(47801);
+  await seeder.mgr.listen();
+  await joiner.mgr.listen();
+  seeder.sync.start();
+  joiner.sync.start();
+
+  const done = new Promise((res) => joiner.sync.once('complete', res));
+  await joiner.mgr.dial({ sporeId: seeder.id.pub, addrs: ['127.0.0.1'], tcpPort: 47800 });
+  await done;
+
+  const rep = joiner.store.replica(author.logId.toString('hex'));
+  assert.equal(rep.held, LONG, `every block arrived (held ${rep.held} of ${LONG})`);
+  assert.equal(rep.linkedTo, LONG - 1, 'and the chain links end to end, not W blocks in');
+  assert.equal(rep.get(LONG - 1).payload.toString(), `long ${LONG - 1}`);
+
+  joiner.sync.stop(); seeder.sync.stop();
+  await joiner.mgr.stop(); await seeder.mgr.stop();
+});
+
+test('sync: a block far above the frontier is still reachable when a peer has it', async () => {
+  // The other half of the same guard, and the one that is genuinely in tension with R10.
+  //
+  // A window bounds how far above linkedTo we will look. This asserts the behaviour that
+  // bound must preserve: a joiner that holds NOTHING of a log, meeting a peer that holds it
+  // from seq 0, ends up with all of it. The window may make that take more rounds; it must
+  // not make it impossible.
+  //
+  // Stated separately from the sliding test because the failure modes differ. The sliding
+  // test catches a window that never advances. This one catches a window applied to the
+  // wrong frontier — clamped against `head` or `total` rather than against `linkedTo` — in
+  // which case a replica with nothing linked has a window of zero and wants no blocks at all.
+  const author = identity();
+  const blocks = chain(author, 120, 'far');
+
+  const seeder = spore(47802, { seedFrom: { id: author, blocks } });
+  const joiner = spore(47803);
+  await seeder.mgr.listen();
+  await joiner.mgr.listen();
+  seeder.sync.start();
+  joiner.sync.start();
+
+  const before = joiner.store.replica(author.logId.toString('hex'));
+  assert.equal(before, null, 'the joiner starts holding nothing of this log');
+
+  const done = new Promise((res) => joiner.sync.once('complete', res));
+  await joiner.mgr.dial({ sporeId: seeder.id.pub, addrs: ['127.0.0.1'], tcpPort: 47802 });
+  await done;
+
+  const rep = joiner.store.replica(author.logId.toString('hex'));
+  assert.equal(rep.linkedTo, 119, 'a standing start must still reach the end');
+  assert.ok(rep.get(119), 'including the block furthest from where we began');
+
+  joiner.sync.stop(); seeder.sync.stop();
+  await joiner.mgr.stop(); await seeder.mgr.stop();
+});
