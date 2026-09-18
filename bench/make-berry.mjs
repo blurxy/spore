@@ -8,10 +8,19 @@
 // Anyone who does not sees a berry.
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { bytesToSelectors, selectorsToBytes } from '../src/app/invite.js';
+// IMPORTED, NOT RESTATED. Every constant below used to be typed in by hand, and the file
+// drifted the moment any of them moved — it published MAX_SEQ = 2^24 for a day after the
+// value changed, along with the REASONING that change disproved. A spec that restates its
+// source is a spec that is wrong as soon as the source is right.
+import { MAX_SEQ, MSG } from '../src/sharding/wire.js';
+import { MAX_LOGS, MAX_INFLIGHT_PER_PEER, FETCH_WINDOW } from '../src/sharding/sync.js';
 
-const SPEC = `SPORE — off-web mycelial mesh — wire protocol
+const MSG_COUNT = Object.keys(MSG).length;
+
+export const SPEC = `SPORE — off-web mycelial mesh — wire protocol
 
 An organism, not a network. Runs whole on one device; gets faster as it spreads.
 Zero dependencies. Node stdlib only. No internet, no bootstrap node, no signalling
@@ -145,7 +154,7 @@ SUBSTRATE
 
 SHARDING
   Rarest-first, adapted from BitTorrent. Endgame mode near completion kills the tail.
-  Six messages, one type byte each, all inside the AEAD:
+  ${MSG_COUNT} messages, one type byte each, all inside the AEAD:
     HAVE      everything I hold, per log, as a bitfield
     HAVE_ADD  I have just acquired (log, seq)
     REQUEST   send me these
@@ -167,11 +176,20 @@ SHARDING
 EVERY NUMBER FROM THE WIRE IS AN ALLOCATION REQUEST
   seq is a u32 and a receiver sizes a bitfield from it, so 23 well-formed bytes
   claiming a block at 4,294,967,295 allocate 512 MB. On a phone that is not a
-  slowdown, it is the process. MAX_SEQ = 2^24 is enforced in the DECODER, because
-  there is nothing correct a caller can do with a larger number and only one place
-  to forget the check. HAVE's bitlen is bounded the same way.
+  slowdown, it is the process. MAX_SEQ = ${MAX_SEQ} (0x${MAX_SEQ.toString(16)}).
+  This spec used to say the check belongs in the DECODER, "because there is only
+  one place to forget it". That reasoning was wrong and the bug it caused was
+  real: BLOCK carries its seq inside the signed cert and never passes through the
+  decoder at all, so the one place was not the only place. It is enforced at
+  insert() now — the single funnel every block reaches, from any transport.
+  It was wrong a second way. A bound on the NUMBER is not a bound on the WORK:
+  the same seq sized a bitfield per (log, peer) with no cap on peers, and an
+  index array of 4 bytes per claimed block. What bounds those is a window above
+  our own delivery frontier, FETCH_WINDOW = ${FETCH_WINDOW}, because the multiplier
+  is a quantity we do not control and a bound depending on an attacker's restraint
+  is not a bound. HAVE's bitlen is bounded by the bytes the sender actually paid.
   Nothing authorises a log into existence either — any peer names one and state is
-  created for it, and any freely-minted key opens a replica. MAX_LOGS = 256, the
+  created for it, and any freely-minted key opens a replica. MAX_LOGS = ${MAX_LOGS}, the
   same number in the syncer and the substrate. Past 65,536 it would also overflow
   the u16 log count in HAVE and our own advertisements would start lying.
 
@@ -207,15 +225,16 @@ THE BUG ONLY REAL SOCKETS FIND
 THE SCALING CLAIM, HONESTLY
   Wi-Fi in infrastructure mode is a SHARED medium; every peer-to-peer byte crosses
   the air twice. So within one cell, speedup saturates. Predicted from arithmetic
-  before any code existed: 3.3x near N=5. Measured: 3.59x at N=5.
-    N=1 6.5s 1.00x   N=2 3.2s 2.04x   N=3 2.1s 3.05x
-    N=5 1.8s 3.59x   N=20 1.8s 3.59x  (flat)
-  Three ceilings, measured apart, because one control was conflating two of them:
-    real Wi-Fi cell, pipeline 6     N=5  3.59x -> N=20  3.59x   the air binds
-    no medium, pipeline still 6     N=5  3.68x -> N=20  4.75x   concurrency binds
-    no medium, no pipeline cap      N=5  5.38x -> N=20 32.30x   nothing binds
-  Inside one cell the medium binds FIRST, so raising pipeline depth buys nothing
-  there. It matters only once the medium stops binding.
+  before any code existed: 3.3x near N=5.
+  THE NUMBERS THAT USED TO BE PRINTED HERE HAVE BEEN REMOVED, and that is the
+  honest correction rather than an omission. They came from a simulation modelling
+  a 3ms round trip, where this implementation's own request window — ${MAX_INFLIGHT_PER_PEER}
+  blocks outstanding per peer — is invisible. The first run on real hardware
+  measured values that sit inside that window's ceiling, so the model and the
+  measurement agreed while plausibly measuring different quantities. A spec is the
+  wrong place for a number under revision: see README.md and
+  docs/RESULTS-2026-09-17.md for what is measured, what is modelled, and which is
+  which. The knee remains unmeasured on real devices.
   What keeps scaling past that is INDEPENDENT RADIO DOMAINS, not peer count.
   Live message delivery latency does NOT get faster, by design.
   Transcode does not get faster because it does not exist.
@@ -258,7 +277,11 @@ you decoded a berry to find a prompt. here is a protocol.
 
 const packed = gzipSync(Buffer.from(SPEC, 'utf8'), { level: 9 });
 const berry = `🫐${bytesToSelectors(packed)}\n`;
-writeFileSync('🫐.txt', berry, 'utf8');
+// Only when run directly. A test that wants to compare the spec against the live constants
+// must be able to import it without rewriting the artefact it is checking.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  writeFileSync('🫐.txt', berry, 'utf8');
+}
 
 // verify it round-trips before claiming anything
 const back = gunzipSync(selectorsToBytes(readFileSync('🫐.txt', 'utf8'))).toString('utf8');
