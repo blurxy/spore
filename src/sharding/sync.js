@@ -423,7 +423,14 @@ export class Syncer extends EventEmitter {
         l.peers.set(peer, p);
         if (!this.peerInflight.has(peer)) this.peerInflight.set(peer, 0);
       }
-      if (seq + 1 > p.have.size) p.have.grow(seq + 1);
+      // Counted too. The allocation for a NEW peer record was charged above; this is the
+      // one for an EXISTING record, and a peer reaches it by sending HAVE_ADD twice — small
+      // first to create the record, then maximal to grow it. Missing this made the oracle
+      // under-report, which is the same class of error as the bug the oracle exists to catch.
+      if (seq + 1 > p.have.size) {
+        this.stats.allocBytes += Math.ceil((seq + 1) / 8) - Math.ceil(p.have.size / 8);
+        p.have.grow(seq + 1);
+      }
       p.have.set(seq);
     }
     this.pump();
@@ -634,7 +641,10 @@ export class Syncer extends EventEmitter {
       // Our own have-set, sized to the longest log anyone knows about.
       if (!replica) this.stats.allocBytes += Math.ceil(total / 8);
       const have = replica ? replica.bits : new Bitfield(total);
-      if (have.size < total) have.grow(total);
+      if (have.size < total) {
+        this.stats.allocBytes += Math.ceil(total / 8) - Math.ceil(have.size / 8);
+        have.grow(total);
+      }
       l.sched.total = total;
 
       // Hand each peer its REMAINING global budget as this log's capacity. maxInflight is

@@ -1201,10 +1201,14 @@ function haveAddFrame(n, seq, saltByte) {
 }
 
 test('sync: work is proportional to what WE hold, not to what a peer CLAIMS', {
-  // EXPECTED TO FAIL until the window bound lands (ARCHITECTURE R10). Measured on the code
-  // as it stands: 55 MiB of counted work when peers claim head 1000, and 32,856 MiB when
-  // they claim MAX_SEQ — a 1049x larger claim buying ~600x more of our work, from three
-  // peers and a few small frames.
+  // EXPECTED TO FAIL until the window bound lands (ARCHITECTURE R10).
+  //
+  // Measured on the code as it stands, across runs: roughly 600x to 750x more counted work
+  // when three peers claim MAX_SEQ than when they claim head 1000. Absolute figures swing a
+  // lot between runs — 8.7 MiB vs 6.3 GiB on one, 55 MiB vs 32 GiB on another — because the
+  // total depends on how many pump() cycles land inside the wait window, and each cycle is
+  // itself slow at MAX_SEQ. The RATIO is the stable quantity and the ratio is what this
+  // asserts. Quote the ratio, not the gigabytes.
   //
   // Marked todo rather than deleted or weakened, because the whole point of this test is to
   // be RED before the fix and green after. A test written after the fix is written to match
