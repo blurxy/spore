@@ -943,6 +943,23 @@ next §5 item and goes ahead of everything else on this list). See R10.
 *Kept at the top on a peer session's suggestion — the observation only surfaced from outside
 the work, so the next reviewer should not have to rediscover it.*
 
+**0b. `dial()` trusts the first ADVERTISED address over the one it heard from.**
+`src/transport/tcp.js` picks `peer.addrs?.[0] || peer.from`, and `lanInterfaces()` enumerates
+every private interface the host has. On a developer machine that means `docker0` at
+`172.17.x` — which passes the `172.16/12` entry in `ALLOW` — plus `virbr0` and any test
+bridge. A spore on such a host advertises those first, and a peer on the real LAN dials an
+address that cannot route to it, having *already heard* a working one in the HELLO's source.
+
+Harmless on a phone, which has no virtual interfaces. It becomes live the moment development
+moves to a Linux box, which is why it is written down here rather than discovered as "the
+tablet cannot see the laptop any more". The fix is small — prefer `from`, or order `addrs` by
+whether they match the interface the HELLO arrived on — but it is a behaviour change to
+discovery and belongs behind a test, not ahead of one.
+
+Interim, for anyone running a spore on a machine with containers or VMs: check what will be
+advertised with `node -e "console.log(Object.keys(require('os').networkInterfaces()))"` before
+blaming the network.
+
 
 - Multi-hop routing, relay, link-state DB (SP2)
 - Epoch encryption for fruiting content: GGM tree, KEYBUNDLE, EPOCH_ROTATE (now a derived
