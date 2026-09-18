@@ -115,6 +115,10 @@ on a laptop/desktop/Raspberry-Pi-class device — Windows, macOS, Linux. "Works 
 > `beacon.js` carries a Windows-only EINVAL branch that exists because someone hit it — but it
 > becomes an *untested* claim the moment nobody runs `npm test` there. Either keep a periodic
 > Windows run, or drop the platform from this line. Do not leave it asserted and unexercised.
+>
+> **Last known-good Windows run: 2026-09-17, commit a7a9688 — 121/121, 2.57 s, Node v24.18.0,
+> win32 x64 10.0.26200.** Dated so the claim points at evidence rather than at nothing. The
+> Android result is separately recorded in RESULTS-2026-09-17.md (119/119 on aarch64).
 hotspot" for SP1 means **a laptop joined to a phone's hotspot AP**, which needs nothing
 beyond the TCP/UDP LAN transport already designed and probe-verified. A phone *as a spore*
 (the literal handheld device running SPORE) requires a native platform shell — an iOS
