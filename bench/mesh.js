@@ -52,6 +52,10 @@ const MODE = has('seed') ? 'seed' : has('join') ? 'join' : null;
 const CORPUS = String(flag('corpus', 'alpha'));
 const BLOCKS = Number(flag('blocks', 400));
 const BLOCK_BYTES = Number(flag('bytes', 32768));
+// --inflight N: blocks outstanding to one peer. Sweeping THIS at a fixed --bytes is the clean
+// discriminator between "the radio is the limit" and "our request window is" — sweeping
+// --bytes confounds the two, because larger blocks also cut per-byte receive cost.
+const INFLIGHT = Number(flag('inflight', 0)) || undefined;
 const PORT = Number(flag('port', HYPHA_PORT));
 const WANT_SOURCES = Number(flag('sources', 1));
 const LABEL = String(flag('label', `${MODE}-${process.pid}`));
@@ -123,7 +127,10 @@ const beacon = new Beacon({
   sporeId, idPrivate: idKeys.privateKey, networkKey: NETWORK_KEY,
   nick: LABEL, telemetry: tel, tcpPort: PORT,
 });
-const sync = new Syncer({ substrate: store, hyphaManager: mgr, telemetry: tel, selfPub: sporeId });
+const sync = new Syncer({
+  substrate: store, hyphaManager: mgr, telemetry: tel, selfPub: sporeId,
+  maxInflightPerPeer: INFLIGHT,
+});
 
 const KEY = author.logId.toString('hex');
 const MB = (b) => (b / 1048576).toFixed(2);

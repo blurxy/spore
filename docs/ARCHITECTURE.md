@@ -913,6 +913,37 @@ pending benchmark confirmation, not final results.
 
 ### Explicitly deferred (named, not silently dropped)
 
+**0. PERSISTENCE — and it was not deferred, it was invisible. Read this one first.**
+
+Nothing in `src/` writes anything to disk. `bin/spore.js` regenerates the ed25519 identity on
+every launch. So a founder who restarts **loses their colony**, because `colony_id` is derived
+from the founder's `log_id`, and every member's history becomes unreachable authority.
+
+It sits at the top of this list precisely because it was never on it. It appears in no §5 item,
+no deferred entry, and no Open Decision — it was not weighed and set aside, it was never seen,
+through a correctness review, an adversarial review round, and a hardware run. It took an
+advisor being asked what the work was *systematically avoiding* rather than what was next.
+
+Two consequences that outrank most of what is below:
+
+- **The eviction machinery is defending a lifetime the platform destroys first.** R4b through
+  R7 — `floorHash`, `floorLamport`, `lost`, `claims`, `#forgottenStop` — all protect a process
+  that runs long enough to accumulate `MAX_BYTES`, which for text is ~150–220K messages
+  colony-wide (`RESULTS-2026-09-17.md`). `TERMUX.md` records that the target platform kills the
+  process routinely. This is the most-worked subsystem in the repo and it guards state the
+  ordinary behaviour of Android discards before it can accumulate.
+- **SP2 cannot start.** Its step 1 derives `wrap_seed` from a `master_seed` the design assumes
+  is at rest under scrypt+AEAD. There is no at-rest anything.
+
+Recorded here rather than fixed because the shape of the answer is a decision, not a patch:
+whether SP1 is a mechanism demonstration (in which case say so, and stop hardening eviction
+past closing the DoS paths) or a product (in which case identity and own-log persistence is the
+next §5 item and goes ahead of everything else on this list). See R10.
+
+*Kept at the top on a peer session's suggestion — the observation only surfaced from outside
+the work, so the next reviewer should not have to rediscover it.*
+
+
 - Multi-hop routing, relay, link-state DB (SP2)
 - Epoch encryption for fruiting content: GGM tree, KEYBUNDLE, EPOCH_ROTATE (now a derived
   right, §1.11), moderation-by-rekey, distinct wrap keypair (§1.14), `has_read_cap` gate for

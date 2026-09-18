@@ -108,7 +108,11 @@ class LogSync {
  *   'progress' { logId, held, total }
  */
 export class Syncer extends EventEmitter {
-  constructor({ substrate, hyphaManager, telemetry = null, selfPub, selfLogId, requestTimeoutNs = REQUEST_TIMEOUT_NS }) {
+  constructor({
+    substrate, hyphaManager, telemetry = null, selfPub, selfLogId,
+    requestTimeoutNs = REQUEST_TIMEOUT_NS,
+    maxInflightPerPeer = MAX_INFLIGHT_PER_PEER,
+  }) {
     super();
     this.store = substrate;
     this.mgr = hyphaManager;
@@ -119,6 +123,20 @@ export class Syncer extends EventEmitter {
     // the recovery path rather than waiting out the real value — a dropped frame is only
     // recovered by this expiring, so a suite that never expires anything never tests it.
     this.requestTimeoutNs = requestTimeoutNs;
+    // How many blocks may be outstanding to one peer at once. Injectable for the same reason
+    // the timeout is, and for one more: it is a THROUGHPUT CEILING nobody had costed.
+    //
+    // A BLOCK is 33,100 bytes on the wire, so six of them is 198,600 bytes in flight — which
+    // at a 9 ms round trip caps a single source at 21.0 MiB/s and at 17 ms caps it at 11.1,
+    // regardless of what the radio can do. The first hardware run measured 7.55–13.66 MiB/s
+    // and every value fell inside that ceiling (docs/RESULTS-2026-09-17.md, R9).
+    //
+    // `bench/curve.js` models a 3 ms RTT, where this bound sits near 63 MiB/s and is therefore
+    // invisible — so the simulation and the hardware agreed with each other while plausibly
+    // measuring different quantities. Sweeping THIS at a fixed block size is the clean
+    // discriminator; sweeping block size is confounded, because larger blocks also reduce
+    // per-byte receive cost.
+    this.maxInflightPerPeer = maxInflightPerPeer;
 
     this.logs = new Map(); // logIdHex -> LogSync
     this.peerInflight = new Map(); // peerHex -> total outstanding across all logs
@@ -366,7 +384,7 @@ export class Syncer extends EventEmitter {
       l.peers.set(peer, {
         have: bitfieldFrom(e.bitlen, e.bits),
         inflight: l.peers.get(peer)?.inflight || new Set(),
-        maxInflight: MAX_INFLIGHT_PER_PEER,
+        maxInflight: this.maxInflightPerPeer,
       });
     }
     this.pump();
@@ -396,7 +414,7 @@ export class Syncer extends EventEmitter {
       if (!l) continue; // at the log cap
       let p = l.peers.get(peer);
       if (!p) {
-        p = { have: new Bitfield(seq + 1), inflight: new Set(), maxInflight: MAX_INFLIGHT_PER_PEER };
+        p = { have: new Bitfield(seq + 1), inflight: new Set(), maxInflight: this.maxInflightPerPeer };
         l.peers.set(peer, p);
         if (!this.peerInflight.has(peer)) this.peerInflight.set(peer, 0);
       }
